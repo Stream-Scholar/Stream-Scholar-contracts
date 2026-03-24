@@ -1,6 +1,8 @@
 #![no_std]
 use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec};
 
+const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Access {
@@ -116,6 +118,9 @@ impl ScholarContract {
         } else {
             access.expiry_time = current_time + seconds_bought;
         }
+        
+        // Update last purchase time to current time
+        access.last_purchase_time = current_time;
 
         env.storage().instance().set(&DataKey::Access(student, course_id), &access);
     }
