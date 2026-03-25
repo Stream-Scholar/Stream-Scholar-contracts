@@ -1,6 +1,12 @@
 #![no_std]
 use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec, Symbol};
 
+// Constants for TTL management and time windows
+const LEDGER_BUMP_THRESHOLD: u32 = 15552000; // ~180 days in ledgers
+const LEDGER_BUMP_EXTEND: u32 = 15552000;   // ~180 days in ledgers
+const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
+const MAX_COURSE_REGISTRY_SIZE: u64 = 1000;  // Maximum number of courses to prevent gas limit issues
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     SbtMint(Address, u64),
@@ -44,6 +50,9 @@ pub enum DataKey {
     Scholarship(Address), // student -> Scholarship struct
     VetoedCourseGlobal(u64),
     Session(Address),
+    CourseRegistry,
+    CourseRegistrySize,
+    CourseInfo(u64),
 }
 
 #[contracttype]
@@ -52,6 +61,22 @@ pub struct SubscriptionTier {
     pub subscriber: Address,
     pub expiry_time: u64,
     pub course_ids: Vec<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CourseInfo {
+    pub course_id: u64,
+    pub created_at: u64,
+    pub is_active: bool,
+    pub creator: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CourseRegistry {
+    pub courses: Vec<u64>,
+    pub last_updated: u64,
 }
 
 #[contract]
@@ -414,12 +439,6 @@ impl ScholarContract {
             return 0;
         }
 
-        }
-
-        if current_time >= access.expiry_time {
-            return 0;
-        }
-
         let remaining_seconds = access.expiry_time - current_time;
         let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
         let refund_amount = (remaining_seconds as i128) * rate;
@@ -448,6 +467,175 @@ impl ScholarContract {
             }
         }
         0
+    }
+
+    // Course Registry Management Functions
+    
+    pub fn add_course_to_registry(env: Env, course_id: u64, creator: Address) {
+        creator.require_auth();
+        
+        // Check if course already exists
+        if let Some(_) = env.storage().persistent().get::<DataKey, CourseInfo>(&DataKey::CourseInfo(course_id)) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Check registry size limit to prevent gas limit issues
+        let registry_size: u64 = env.storage().persistent().get(&DataKey::CourseRegistrySize).unwrap_or(0);
+        if registry_size >= MAX_COURSE_REGISTRY_SIZE {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::LimitExceeded));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Create course info
+        let course_info = CourseInfo {
+            course_id,
+            created_at: current_time,
+            is_active: true,
+            creator: creator.clone(),
+        };
+        env.storage().persistent().set(&DataKey::CourseInfo(course_id), &course_info);
+        env.storage().persistent().extend_ttl(&DataKey::CourseInfo(course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Update registry
+        let mut registry: CourseRegistry = env.storage().persistent().get(&DataKey::CourseRegistry)
+            .unwrap_or(CourseRegistry {
+                courses: Vec::new(&env),
+                last_updated: current_time,
+            });
+        
+        registry.courses.push_back(course_id);
+        registry.last_updated = current_time;
+        
+        env.storage().persistent().set(&DataKey::CourseRegistry, &registry);
+        env.storage().persistent().extend_ttl(&DataKey::CourseRegistry, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Update size counter
+        env.storage().persistent().set(&DataKey::CourseRegistrySize, &(registry_size + 1));
+        env.storage().persistent().extend_ttl(&DataKey::CourseRegistrySize, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+    
+    pub fn list_courses(env: Env) -> Vec<u64> {
+        let registry: CourseRegistry = env.storage().persistent().get(&DataKey::CourseRegistry)
+            .unwrap_or(CourseRegistry {
+                courses: Vec::new(&env),
+                last_updated: 0,
+            });
+        
+        // Extend TTL to prevent data expiration
+        env.storage().persistent().extend_ttl(&DataKey::CourseRegistry, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        registry.courses
+    }
+    
+    pub fn list_courses_paginated(env: Env, offset: u32, limit: u32) -> Vec<u64> {
+        // Validate pagination parameters to prevent excessive gas consumption
+        if limit > 100 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let registry: CourseRegistry = env.storage().persistent().get(&DataKey::CourseRegistry)
+            .unwrap_or(CourseRegistry {
+                courses: Vec::new(&env),
+                last_updated: 0,
+            });
+        
+        // Extend TTL to prevent data expiration
+        env.storage().persistent().extend_ttl(&DataKey::CourseRegistry, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        let total_courses = registry.courses.len();
+        let offset = offset as usize;
+        let limit = limit as usize;
+        
+        if offset >= total_courses {
+            return Vec::new(&env);
+        }
+        
+        let end_index = std::cmp::min(offset + limit, total_courses);
+        let mut result = Vec::new(&env);
+        
+        for i in offset..end_index {
+            result.push_back(registry.courses.get(i).unwrap());
+        }
+        
+        result
+    }
+    
+    pub fn get_course_info(env: Env, course_id: u64) -> CourseInfo {
+        let course_info: CourseInfo = env.storage().persistent().get(&DataKey::CourseInfo(course_id))
+            .unwrap_or_else(|| env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::NotFound)));
+        
+        // Extend TTL to prevent data expiration
+        env.storage().persistent().extend_ttl(&DataKey::CourseInfo(course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        course_info
+    }
+    
+    pub fn deactivate_course(env: Env, admin: Address, course_id: u64) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let mut course_info: CourseInfo = env.storage().persistent().get(&DataKey::CourseInfo(course_id))
+            .unwrap_or_else(|| env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::NotFound)));
+        
+        course_info.is_active = false;
+        env.storage().persistent().set(&DataKey::CourseInfo(course_id), &course_info);
+        env.storage().persistent().extend_ttl(&DataKey::CourseInfo(course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+    
+    pub fn cleanup_inactive_courses(env: Env, admin: Address) -> u64 {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let registry: CourseRegistry = env.storage().persistent().get(&DataKey::CourseRegistry)
+            .unwrap_or(CourseRegistry {
+                courses: Vec::new(&env),
+                last_updated: 0,
+            });
+        
+        let mut removed_count = 0;
+        let mut active_courses = Vec::new(&env);
+        let current_time = env.ledger().timestamp();
+        
+        // Filter out inactive courses
+        for i in 0..registry.courses.len() {
+            let course_id = registry.courses.get(i).unwrap();
+            if let Some(course_info) = env.storage().persistent().get::<DataKey, CourseInfo>(&DataKey::CourseInfo(course_id)) {
+                if course_info.is_active {
+                    active_courses.push_back(course_id);
+                } else {
+                    // Remove inactive course info
+                    env.storage().persistent().remove(&DataKey::CourseInfo(course_id));
+                    removed_count += 1;
+                }
+            }
+        }
+        
+        // Update registry with only active courses
+        let updated_registry = CourseRegistry {
+            courses: active_courses,
+            last_updated: current_time,
+        };
+        
+        env.storage().persistent().set(&DataKey::CourseRegistry, &updated_registry);
+        env.storage().persistent().extend_ttl(&DataKey::CourseRegistry, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Update size counter
+        let new_size = updated_registry.courses.len() as u64;
+        env.storage().persistent().set(&DataKey::CourseRegistrySize, &new_size);
+        env.storage().persistent().extend_ttl(&DataKey::CourseRegistrySize, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        removed_count
     }
 }
 

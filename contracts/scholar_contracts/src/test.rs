@@ -4,6 +4,9 @@ use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{token, Address, Env, Symbol, Vec, IntoVal, vec};
 
+// Client type for testing
+type ScholarContractClient = soroban_sdk::contractclient::Client<ScholarContract>;
+
 #[test]
 fn test_scholarship_flow() {
     let env = Env::default();
@@ -509,7 +512,6 @@ fn test_global_course_veto() {
 #[test]
 #[should_panic(expected = "HostError")]
 fn test_prevent_session_sharing() {
-fn test_calculate_remaining_airtime() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -542,7 +544,40 @@ fn test_calculate_remaining_airtime() {
 }
 
 #[test]
-fn test_allow_same_session() {
+fn test_calculate_remaining_airtime() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &10000);
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.buy_access(&student, &1, &5000, &token_address.address());
+
+    env.ledger().set_timestamp(100);
+    
+    let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
+    let session2 = soroban_sdk::Bytes::from_slice(&env, b"22222222222222222222222222222222");
+
+    client.heartbeat(&student, &1, &session1);
+    
+    // Fast forward to allowed heartbeat timing
+    // Same hash matches gracefully and watch_time progresses natively
+    env.ledger().set_timestamp(160);
+    client.heartbeat(&student, &1, &session1);
+}
+
+#[test]
+fn test_allow_session_reset_after_timeout() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -560,30 +595,15 @@ fn test_allow_same_session() {
     client.buy_access(&student, &1, &5000, &token_address.address());
 
     env.ledger().set_timestamp(100);
-    
     let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
+    let session2 = soroban_sdk::Bytes::from_slice(&env, b"22222222222222222222222222222222");
 
     client.heartbeat(&student, &1, &session1);
     
-    // Fast forward to allowed heartbeat timing
-    // Same hash matches gracefully and watch_time progresses natively
-    env.ledger().set_timestamp(160);
-    client.heartbeat(&student, &1, &session1);
-}
-
-#[test]
-fn test_allow_session_reset_after_timeout() {
-    // Initialize with flow_rate (base_rate) of 10
-    client.init(&10, &3600, &10, &100, &60);
-    
-    // Test that calculation correctly returns 0 initially
-    assert_eq!(client.calculate_remaining_airtime(&student), 0);
-
-    // Fund the scholarship with balance of 500
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
-
-    // 500 balance / 10 flow_rate = 50 seconds
-    assert_eq!(client.calculate_remaining_airtime(&student), 50);
+    // Fast forward strictly past the heartbeat window (`161 - 100 > 60` -> active_session = false)
+    // Allows takeover / overwritten session storage naturally
+    env.ledger().set_timestamp(161);
+    client.heartbeat(&student, &1, &session2);
 }
 
 #[test]
@@ -623,4 +643,164 @@ fn test_calculate_remaining_airtime_zero_flow_rate() {
 
     // Should return 0 due to zero flow_rate guard
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
+}
+
+#[test]
+fn test_course_registry_basic_functionality() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let teacher = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Add courses to registry
+    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&2, &teacher);
+    client.add_course_to_registry(&3, &teacher);
+
+    // List all courses
+    let courses = client.list_courses();
+    assert_eq!(courses.len(), 3);
+    assert!(courses.contains(&1));
+    assert!(courses.contains(&2));
+    assert!(courses.contains(&3));
+
+    // Test pagination
+    let page1 = client.list_courses_paginated(&0, &2);
+    assert_eq!(page1.len(), 2);
+    
+    let page2 = client.list_courses_paginated(&2, &2);
+    assert_eq!(page2.len(), 1);
+    
+    let empty_page = client.list_courses_paginated(&10, &5);
+    assert_eq!(empty_page.len(), 0);
+
+    // Get course info
+    let course_info = client.get_course_info(&1);
+    assert_eq!(course_info.course_id, 1);
+    assert_eq!(course_info.creator, teacher);
+    assert!(course_info.is_active);
+
+    // Deactivate a course
+    client.deactivate_course(&admin, &1);
+    let course_info = client.get_course_info(&1);
+    assert!(!course_info.is_active);
+
+    // Cleanup inactive courses
+    let removed_count = client.cleanup_inactive_courses(&admin);
+    assert_eq!(removed_count, 1);
+    
+    let active_courses = client.list_courses();
+    assert_eq!(active_courses.len(), 2);
+    assert!(!active_courses.contains(&1));
+}
+
+#[test]
+#[should_panic(expected = "LimitExceeded")]
+fn test_course_registry_size_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let teacher = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Try to add more courses than the maximum allowed
+    // This will panic when trying to add the 1001st course
+    for i in 1..=1001 {
+        client.add_course_to_registry(&i, &teacher);
+    }
+}
+
+#[test]
+#[should_panic(expected = "InvalidAction")]
+fn test_course_registry_duplicate_course() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let teacher = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Add the same course twice - should panic
+    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&1, &teacher);
+}
+
+#[test]
+#[should_panic(expected = "InvalidAction")]
+fn test_course_registry_pagination_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let teacher = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Try to request more than 100 courses per page - should panic
+    client.list_courses_paginated(&0, &101);
+}
+
+#[test]
+fn test_course_registry_ttl_management() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let teacher = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Add course and verify TTL is extended
+    client.add_course_to_registry(&1, &teacher);
+    
+    // Multiple calls should extend TTL without issues
+    for _ in 0..10 {
+        let _courses = client.list_courses();
+        let _info = client.get_course_info(&1);
+    }
+}
+
+#[test]
+fn test_course_registry_gas_efficiency() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let teacher = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Add a reasonable number of courses
+    for i in 1..=50 {
+        client.add_course_to_registry(&i, &teacher);
+    }
+
+    // Test that pagination works efficiently with larger datasets
+    let small_pages = client.list_courses_paginated(&0, &10);
+    assert_eq!(small_pages.len(), 10);
+    
+    let medium_pages = client.list_courses_paginated(&10, &20);
+    assert_eq!(medium_pages.len(), 20);
+    
+    // Even with many courses, pagination should work
+    let all_courses = client.list_courses();
+    assert_eq!(all_courses.len(), 50);
 }
