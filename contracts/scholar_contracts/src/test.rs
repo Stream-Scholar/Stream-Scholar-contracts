@@ -182,6 +182,7 @@ fn test_minimum_deposit() {
 }
 
 #[test]
+
 fn test_admin_veto() {
     let env = Env::default();
     env.mock_all_auths();
