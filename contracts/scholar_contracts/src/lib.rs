@@ -207,7 +207,12 @@ impl ScholarContract {
         
         // Update watch time and heartbeat
         if access.last_heartbeat > 0 {
-            access.total_watch_time += current_time - access.last_heartbeat;
+            let elapsed = current_time - access.last_heartbeat;
+            // Only count if it's within a reasonable window of the heartbeat interval
+            // This ensures the contract stops charging if heartbeats are missed
+            if elapsed <= heartbeat_interval + 15 { // 15s grace period for jitter
+                access.total_watch_time += elapsed;
+            }
         }
         access.last_heartbeat = current_time;
         
@@ -234,6 +239,19 @@ impl ScholarContract {
         
         env.storage().persistent().set(&DataKey::Access(student.clone(), course_id), &access);
         env.storage().persistent().extend_ttl(&DataKey::Access(student, course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+
+    pub fn get_watch_time(env: Env, student: Address, course_id: u64) -> u64 {
+        let access: Access = env.storage().instance().get(&DataKey::Access(student, course_id))
+            .unwrap_or(Access {
+                student: Address::generate(&env), // dummy
+                course_id,
+                expiry_time: 0,
+                token: Address::generate(&env), // dummy
+                total_watch_time: 0,
+                last_heartbeat: 0,
+            });
+        access.total_watch_time
     }
 
     pub fn is_sbt_minted(env: Env, student: Address, course_id: u64) -> bool {
