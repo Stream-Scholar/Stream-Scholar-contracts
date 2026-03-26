@@ -1,53 +1,110 @@
-# 🚀 Automated Wasm Size Benchmarking for Soroban Contracts
+# 🚀 Setup Local Test Network with Mock Content
 
 ## 📋 Summary
 
-This PR implements an automated Wasm size benchmarking system for the Stream Scholar contracts to ensure compliance with Soroban's strict 64KB limit. The system provides comprehensive size analysis, detailed reporting, and fails the pipeline if the limit is exceeded.
+This PR implements a Docker-based local test network setup for the Stream Scholar contracts, pre-loading 5 dummy courses and 100 test USDC for developer testing. The setup provides a complete development environment with automated contract deployment and mock data initialization.
 
 ## ✨ Features
 
-### 🔄 CI/CD Integration
-- **Automated Size Checking**: Runs on every push and pull request to `main`
-- **Release Build Optimization**: Uses optimized release builds for accurate size measurement
-- **Cross-Platform Compatibility**: Works across different Linux distributions with automatic dependency installation
-- **Detailed GitHub Actions Summary**: Rich, formatted reports with emojis and optimization tips
+### 🐳 Docker Environment
+- **Containerized Setup**: Uses official `stellar/soroban-cli` Docker image
+- **Automated Network Initialization**: Starts local Soroban network with all dependencies
+- **Persistent Environment**: Network remains running for interactive testing
+- **Volume Mounting**: Full project access within container
 
-### 📊 Comprehensive Reporting
-- **Exact Size Metrics**: Precise byte and kilobyte measurements
-- **Utilization Percentage**: Shows how much of the 64KB limit is being used
-- **Remaining Capacity**: Calculates available space for future features
-- **Optimization Tips**: Provides actionable suggestions for size reduction
+### 📦 Mock Data Pre-loading
+- **5 Dummy Courses**: Automatically added to course registry with teacher as creator
+- **100 Test USDC**: Minted to student account using custom token contract
+- **Test Accounts**: Pre-generated admin, teacher, and student accounts with funding
+- **Contract Initialization**: Scholar contract configured with default parameters
 
-### 🛠️ Local Development Tools
-- **Bash Script**: Unix/Linux/macOS compatible testing script
-- **PowerShell Script**: Windows-compatible testing script
-- **Manual Testing**: Documentation for manual size verification
+### 🔧 Contract Deployment
+- **Token Contract**: Custom USDC token contract deployment and initialization
+- **Scholar Contract**: Full deployment with admin/teacher setup and course registry
+- **Account Management**: Automated key generation and funding
+- **Network Configuration**: Standalone Soroban network for isolated testing
+
+### 🧪 Testing Framework
+- **Verification Commands**: Step-by-step testing instructions in README
+- **Interactive Testing**: Exec into running container for manual verification
+- **Expected Outputs**: Clear success criteria for each test case
+- **Error Handling**: Comprehensive logging and failure detection
 
 ## 🔧 Implementation Details
 
-### Pipeline Changes
+### Docker Configuration
 ```yaml
-- name: Install bc for calculations
-- name: Build Wasm contract
-- name: Check Wasm size
+version: '3.8'
+services:
+  soroban-local:
+    image: stellar/soroban-cli:latest
+    volumes:
+      - .:/workspace
+    ports:
+      - "8000:8000"
 ```
 
-### Size Validation Logic
-- **Limit**: 64KB (65,536 bytes) - Soroban's hard limit
-- **Build Target**: `wasm32-unknown-unknown` with release optimizations
-- **Error Handling**: Fails pipeline if limit exceeded
-- **Fallback Calculations**: Uses `awk` if `bc` is unavailable
+### Setup Script Flow
+1. **Network Start**: Initialize local Soroban standalone network
+2. **Account Generation**: Create admin, teacher, and student keypairs
+3. **Funding**: Fund all accounts with test XLM
+4. **Contract Building**: Compile all contracts (token and scholar)
+5. **Token Deployment**: Deploy and initialize USDC token
+6. **Scholar Deployment**: Deploy and configure scholar contract
+7. **Mock Data Loading**: Add courses and mint USDC
+8. **Verification**: Display all contract IDs and account details
 
-### Reporting Features
-- **Console Output**: Real-time feedback during CI runs
-- **GitHub Actions Summary**: Persistent, formatted reports
-- **Status Indicators**: Visual success/failure indicators
-- **Optimization Guidance**: Tips for reducing Wasm size
+### Mock Data Specifications
+- **Courses**: IDs 1-5, created by teacher account, active status
+- **USDC**: 100 tokens (1000000000 units with 7 decimals) minted to student
+- **Roles**: Admin has full permissions, teacher can add courses
+- **Parameters**: Default heartbeat interval, pricing, and discount settings
 
 ## 📁 New Files
 
+### Docker Configuration
+- `docker-compose.yml` - Docker Compose configuration for local network
+
 ### Scripts
-- `scripts/check-wasm-size.sh` - Unix/Linux/macOS testing script
+- `scripts/setup-local.sh` - Automated setup script for mock environment
+
+### Contracts
+- `contracts/token/Cargo.toml` - Token contract package configuration
+- `contracts/token/src/lib.rs` - Standard Soroban token implementation
+
+### Documentation
+- `README.md` (updated) - Added local test network setup and testing instructions
+
+## 🧪 Testing Instructions
+
+### Setup Verification
+1. Run `docker compose up` in project root
+2. Wait for "Setup complete!" message
+3. Note contract IDs and account addresses from output
+
+### Manual Testing
+1. Exec into container: `docker compose exec soroban-local bash`
+2. Verify courses: `soroban contract invoke --id <scholar_id> -- list_courses`
+3. Check USDC balance: `soroban contract invoke --id <token_id> -- balance --id <student_addr>`
+4. Test course info: `soroban contract invoke --id <scholar_id> -- get_course_info --course_id 1`
+
+### Expected Results
+- Courses list: `[1,2,3,4,5]`
+- USDC balance: `1000000000`
+- Course active: `true`
+- All contract interactions succeed
+
+## 🎯 Assignment Completion
+
+This PR fulfills assignment #38: "Setup Local_Test_Network with Mock Content - A Docker environment that pre-loads 5 dummy courses and 100 test USDC for developer testing."
+
+The implementation provides:
+- ✅ Docker environment for local testing
+- ✅ 5 pre-loaded dummy courses
+- ✅ 100 test USDC tokens
+- ✅ Complete setup automation
+- ✅ Verification testing framework
+- ✅ Developer-friendly documentation
 - `scripts/check-wasm-size.ps1` - Windows PowerShell testing script
 
 ### Documentation
