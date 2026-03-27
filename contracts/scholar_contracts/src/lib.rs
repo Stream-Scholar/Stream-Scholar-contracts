@@ -62,6 +62,8 @@ pub enum DataKey {
     GroupPool(u64), // pool_id -> GroupPool struct
     GroupPoolMember(u64, Address), // pool_id, member -> contribution
     GroupPoolAccess(u64, Address), // pool_id, member -> has_access flag
+    ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> quiz proof
+    ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
 }
 
 #[contracttype]
@@ -108,6 +110,18 @@ pub struct GroupPool {
     pub is_active: bool,
     pub member_count: u64,
     pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct QuizProof {
+    pub student: Address,
+    pub course_id: u64,
+    pub module_id: u64,
+    pub quiz_hash: Symbol, // Hash of the quiz result
+    pub score: u64,
+    pub passed_at: u64,
+    pub is_verified: bool,
 }
 
 #[contract]
@@ -1131,6 +1145,169 @@ impl ScholarContract {
             // In production, you'd need to track member list properly
             // This is a simplified version
         }
+    }
+
+    // Quiz Lock Feature - Lock modules until quiz is passed
+    
+    pub fn configure_module_quiz(env: Env, admin: Address, course_id: u64, module_id: u64, requires_quiz: bool) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().persistent().set(&DataKey::ModuleLockConfig(course_id, module_id), &requires_quiz);
+        env.storage().persistent().extend_ttl(&DataKey::ModuleLockConfig(course_id, module_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Module_Quiz_Configured"), course_id, module_id),
+            requires_quiz
+        );
+    }
+
+    pub fn submit_quiz_proof(env: Env, student: Address, course_id: u64, module_id: u64, quiz_hash: Symbol, score: u64) {
+        student.require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Create quiz proof record
+        let quiz_proof = QuizProof {
+            student: student.clone(),
+            course_id,
+            module_id,
+            quiz_hash: quiz_hash.clone(),
+            score,
+            passed_at: current_time,
+            is_verified: true, // In production, this would require verification logic
+        };
+        
+        // Store the quiz proof
+        env.storage().persistent().set(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), &quiz_proof);
+        env.storage().persistent().extend_ttl(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Quiz_Proof_Submitted"), student, course_id),
+            (module_id, quiz_hash, score)
+        );
+    }
+
+    pub fn verify_module_unlocked(env: Env, student: Address, course_id: u64, module_id: u64) -> bool {
+        // Check if this module requires a quiz
+        let requires_quiz: bool = env.storage().persistent()
+            .get(&DataKey::ModuleLockConfig(course_id, module_id))
+            .unwrap_or(false);
+        
+        if !requires_quiz {
+            return true; // No quiz required, module is unlocked
+        }
+        
+        // For module 1, always allow access (no prerequisite)
+        if module_id == 1 {
+            return true;
+        }
+        
+        // Check if previous module's quiz is completed
+        let previous_module = module_id - 1;
+        
+        // Check if student has passed quiz for previous module
+        let quiz_proof: Option<QuizProof> = env.storage().persistent()
+            .get(&DataKey::ModuleQuizLock(student.clone(), course_id, previous_module));
+        
+        if let Some(proof) = quiz_proof {
+            // Require minimum passing score (e.g., 70%)
+            if proof.is_verified && proof.score >= 70 {
+                return true;
+            }
+        }
+        
+        false // Module is locked
+    }
+
+    pub fn get_quiz_proof(env: Env, student: Address, course_id: u64, module_id: u64) -> QuizProof {
+        let key = DataKey::ModuleQuizLock(student.clone(), course_id, module_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).expect("Quiz proof not found")
+        } else {
+            panic!("Quiz proof not found");
+        }
+    }
+
+    pub fn get_module_progress(env: Env, student: Address, course_id: u64, total_modules: u64) -> Vec<u64> {
+        let mut unlocked_modules = Vec::new(&env);
+        
+        for module_id in 1..=total_modules {
+            if Self::verify_module_unlocked(env.clone(), student.clone(), course_id, module_id) {
+                unlocked_modules.push_back(module_id);
+            }
+        }
+        
+        unlocked_modules
+    }
+
+    pub fn lock_module(env: Env, admin: Address, student: Address, course_id: u64, module_id: u64) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Remove quiz proof if exists (force re-lock)
+        let key = DataKey::ModuleQuizLock(student.clone(), course_id, module_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            
+            // Emit event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Module_Locked"), student, course_id),
+                module_id
+            );
+        }
+    }
+
+    pub fn batch_submit_quiz_proofs(env: Env, student: Address, course_id: u64, module_ids: Vec<u64>, quiz_hashes: Vec<Symbol>, scores: Vec<u64>) {
+        student.require_auth();
+        
+        if module_ids.len() != quiz_hashes.len() || module_ids.len() != scores.len() {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        for i in 0..module_ids.len() {
+            let module_id = module_ids.get(i).unwrap();
+            let quiz_hash = quiz_hashes.get(i).unwrap();
+            let score = scores.get(i).unwrap();
+            
+            let quiz_proof = QuizProof {
+                student: student.clone(),
+                course_id,
+                module_id,
+                quiz_hash: quiz_hash.clone(),
+                score,
+                passed_at: current_time,
+                is_verified: true,
+            };
+            
+            env.storage().persistent().set(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), &quiz_proof);
+            env.storage().persistent().extend_ttl(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Batch_Quiz_Proofs_Submitted"), student, course_id),
+            module_ids.len()
+        );
     }
 }
 
