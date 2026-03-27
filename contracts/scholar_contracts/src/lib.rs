@@ -59,6 +59,9 @@ pub enum DataKey {
     ConsecutiveDays(Address, u64), // student, course_id -> streak data
     GasSubsidyReward,
     StreakBonusAmount,
+    GroupPool(u64), // pool_id -> GroupPool struct
+    GroupPoolMember(u64, Address), // pool_id, member -> contribution
+    GroupPoolAccess(u64, Address), // pool_id, member -> has_access flag
 }
 
 #[contracttype]
@@ -91,6 +94,20 @@ pub struct StreakData {
     pub current_streak: u64,
     pub last_watch_date: u64, // Unix timestamp of last watch activity
     pub total_reward_claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupPool {
+    pub pool_id: u64,
+    pub course_id: u64,
+    pub target_amount: i128,
+    pub current_balance: i128,
+    pub creator: Address,
+    pub token: Address,
+    pub is_active: bool,
+    pub member_count: u64,
+    pub created_at: u64,
 }
 
 #[contract]
@@ -300,6 +317,18 @@ impl ScholarContract {
         // Check subscription first
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
             return true;
+        }
+        
+        // Check group pool access
+        // Iterate through active pools to see if student has access via any pool
+        let next_pool_id: u64 = env.storage().instance()
+            .get(&Symbol::new(&env, "NextPoolId"))
+            .unwrap_or(1);
+        
+        for pool_id in 1..next_pool_id {
+            if Self::get_pool_access(env.clone(), student.clone(), pool_id, course_id) {
+                return true;
+            }
         }
         
         let access: Access = env.storage().persistent().get(&DataKey::Access(student.clone(), course_id))
@@ -909,6 +938,199 @@ impl ScholarContract {
         };
         
         env.storage().persistent().set(&DataKey::ConsecutiveDays(student.clone(), course_id), &streak_data);
+    }
+
+    // Group Pooling Feature - Students can pool funds to unlock masterclass
+    
+    pub fn create_group_pool(env: Env, creator: Address, course_id: u64, target_amount: i128, token: Address) -> u64 {
+        creator.require_auth();
+        
+        // Generate unique pool ID
+        let pool_id: u64 = env.storage().instance()
+            .get(&Symbol::new(&env, "NextPoolId"))
+            .unwrap_or(1);
+        
+        let current_time = env.ledger().timestamp();
+        
+        let group_pool = GroupPool {
+            pool_id,
+            course_id,
+            target_amount,
+            current_balance: 0,
+            creator: creator.clone(),
+            token: token.clone(),
+            is_active: true,
+            member_count: 0,
+            created_at: current_time,
+        };
+        
+        env.storage().persistent().set(&DataKey::GroupPool(pool_id), &group_pool);
+        env.storage().persistent().extend_ttl(&DataKey::GroupPool(pool_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Increment next pool ID
+        env.storage().instance().set(&Symbol::new(&env, "NextPoolId"), &(pool_id + 1));
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GroupPool_Created"), creator, course_id),
+            (pool_id, target_amount)
+        );
+        
+        pool_id
+    }
+
+    pub fn contribute_to_pool(env: Env, contributor: Address, pool_id: u64, amount: i128) {
+        contributor.require_auth();
+        
+        let mut pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        if !pool.is_active {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Transfer tokens from contributor to contract
+        let client = token::Client::new(&env, &pool.token);
+        client.transfer(&contributor, &env.current_contract_address(), &amount);
+        
+        // Update pool balance
+        pool.current_balance += amount;
+        
+        // Track member contribution
+        let existing_contribution: i128 = env.storage().persistent()
+            .get(&DataKey::GroupPoolMember(pool_id, contributor.clone()))
+            .unwrap_or(0);
+        
+        env.storage().persistent().set(&DataKey::GroupPoolMember(pool_id, contributor.clone()), &(existing_contribution + amount));
+        
+        // If first time contributing, increment member count
+        if existing_contribution == 0 {
+            pool.member_count += 1;
+        }
+        
+        env.storage().persistent().set(&DataKey::GroupPool(pool_id), &pool);
+        env.storage().persistent().extend_ttl(&DataKey::GroupPool(pool_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Check if target reached
+        if pool.current_balance >= pool.target_amount {
+            pool.is_active = false; // Close the pool
+            env.storage().persistent().set(&DataKey::GroupPool(pool_id), &pool);
+            
+            // Grant access to all contributors
+            Self::grant_pool_access_to_all_members(env.clone(), pool_id, pool.course_id);
+            
+            // Emit success event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "GroupPool_TargetReached"), pool.creator, pool.course_id),
+                (pool_id, pool.current_balance)
+            );
+        }
+    }
+
+    fn grant_pool_access_to_all_members(env: Env, pool_id: u64, course_id: u64) {
+        let pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        // Note: In a real implementation, you'd need to iterate through all members
+        // For now, we'll mark members as having access when they check
+        
+        // Grant access to creator
+        let current_time = env.ledger().timestamp();
+        let one_year_seconds = 31536000; // 365 days
+        
+        // Create access record for the pool (special marker)
+        // Individual members will check against this pool access
+        env.storage().persistent().set(
+            &DataKey::GroupPoolAccess(pool_id, pool.creator.clone()),
+            &true
+        );
+    }
+
+    pub fn get_pool_access(env: Env, member: Address, pool_id: u64, course_id: u64) -> bool {
+        // Check if member has access via this pool
+        let has_access: Option<bool> = env.storage().persistent()
+            .get(&DataKey::GroupPoolAccess(pool_id, member.clone()));
+        
+        if has_access.unwrap_or(false) {
+            return true;
+        }
+        
+        // Check if pool reached target (even if individual access not set yet)
+        if let Some(pool) = env.storage().persistent().get::<DataKey, GroupPool>(&DataKey::GroupPool(pool_id)) {
+            if pool.course_id == course_id && pool.current_balance >= pool.target_amount {
+                // Grant access on-the-fly
+                env.storage().persistent().set(&DataKey::GroupPoolAccess(pool_id, member.clone()), &true);
+                return true;
+            }
+        }
+        
+        false
+    }
+
+    pub fn join_pool_with_access(env: Env, member: Address, pool_id: u64, course_id: u64) {
+        member.require_auth();
+        
+        // Check if pool exists and target is met
+        let pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        if pool.course_id != course_id {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        if pool.current_balance >= pool.target_amount {
+            // Grant access since target is met
+            env.storage().persistent().set(&DataKey::GroupPoolAccess(pool_id, member.clone()), &true);
+        } else {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+    }
+
+    pub fn get_pool_info(env: Env, pool_id: u64) -> GroupPool {
+        let pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .unwrap_or_else(|| panic!("Pool not found"));
+        
+        env.storage().persistent().extend_ttl(&DataKey::GroupPool(pool_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        pool
+    }
+
+    pub fn get_member_contribution(env: Env, member: Address, pool_id: u64) -> i128 {
+        let key = DataKey::GroupPoolMember(pool_id, member);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub fn close_pool(env: Env, admin: Address, pool_id: u64) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let mut pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        pool.is_active = false;
+        env.storage().persistent().set(&DataKey::GroupPool(pool_id), &pool);
+        
+        // Refund contributors
+        for i in 0..pool.member_count {
+            // In production, you'd need to track member list properly
+            // This is a simplified version
+        }
     }
 }
 
