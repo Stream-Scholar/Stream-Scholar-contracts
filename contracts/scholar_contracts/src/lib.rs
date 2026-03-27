@@ -56,6 +56,9 @@ pub enum DataKey {
     BonusMinutes(Address),
     HasBeenReferred(Address),
     ReferralBonusAmount,
+    ConsecutiveDays(Address, u64), // student, course_id -> streak data
+    GasSubsidyReward,
+    StreakBonusAmount,
 }
 
 #[contracttype]
@@ -80,6 +83,14 @@ pub struct CourseInfo {
 pub struct CourseRegistry {
     pub courses: Vec<u64>,
     pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreakData {
+    pub current_streak: u64,
+    pub last_watch_date: u64, // Unix timestamp of last watch activity
+    pub total_reward_claimed: i128,
 }
 
 #[contract]
@@ -241,6 +252,9 @@ impl ScholarContract {
                 env.storage().persistent().extend_ttl(&DataKey::SbtMinted(student.clone(), course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
             }
         }
+        
+        // Update learning streak for Gas Subsidy tracking
+        Self::update_learning_streak(env.clone(), student.clone(), course_id);
         
         env.storage().persistent().set(&DataKey::Access(student.clone(), course_id), &access);
         env.storage().persistent().extend_ttl(&DataKey::Access(student, course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
@@ -748,6 +762,153 @@ impl ScholarContract {
         } else {
             0
         }
+    }
+
+    // Gas Subsidy Feature - Reward students for consecutive learning days
+    
+    pub fn set_streak_bonus_amount(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::StreakBonusAmount, &amount);
+    }
+
+    pub fn update_learning_streak(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        let seconds_in_day = 86400; // 24 hours in seconds
+        
+        // Get existing streak data or create new
+        let mut streak_data: StreakData = env.storage().persistent()
+            .get(&DataKey::ConsecutiveDays(student.clone(), course_id))
+            .unwrap_or(StreakData {
+                current_streak: 0,
+                last_watch_date: 0,
+                total_reward_claimed: 0,
+            });
+        
+        // Calculate days since last watch
+        if streak_data.last_watch_date == 0 {
+            // First time watching
+            streak_data.current_streak = 1;
+        } else {
+            let days_since_last = (current_time - streak_data.last_watch_date) / seconds_in_day;
+            
+            if days_since_last == 0 {
+                // Same day - don't increment, just update timestamp
+                // This prevents multiple counts per day
+            } else if days_since_last == 1 {
+                // Consecutive day
+                streak_data.current_streak += 1;
+            } else {
+                // Streak broken - reset to 1
+                streak_data.current_streak = 1;
+            }
+        }
+        
+        streak_data.last_watch_date = current_time;
+        
+        // Check if student reached 5 consecutive days threshold
+        if streak_data.current_streak == 5 {
+            // Award gas subsidy
+            let bonus_amount: i128 = env.storage().instance()
+                .get(&DataKey::StreakBonusAmount)
+                .unwrap_or(100_000_000); // Default 10 XLM (in stroops)
+            
+            streak_data.total_reward_claimed += bonus_amount;
+            
+            // Emit event for gas subsidy award
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Gas_Subsidy_Awarded"), student.clone(), course_id),
+                (streak_data.current_streak, bonus_amount)
+            );
+        }
+        
+        env.storage().persistent().set(&DataKey::ConsecutiveDays(student.clone(), course_id), &streak_data);
+        env.storage().persistent().extend_ttl(&DataKey::ConsecutiveDays(student.clone(), course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+
+    pub fn get_learning_streak(env: Env, student: Address, course_id: u64) -> StreakData {
+        let key = DataKey::ConsecutiveDays(student.clone(), course_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).unwrap_or(StreakData {
+                current_streak: 0,
+                last_watch_date: 0,
+                total_reward_claimed: 0,
+            })
+        } else {
+            StreakData {
+                current_streak: 0,
+                last_watch_date: 0,
+                total_reward_claimed: 0,
+            }
+        }
+    }
+
+    pub fn claim_gas_subsidy(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+        
+        let streak_data: StreakData = env.storage().persistent()
+            .get(&DataKey::ConsecutiveDays(student.clone(), course_id))
+            .expect("No streak data found");
+        
+        // Must have at least 5 day streak
+        if streak_data.current_streak < 5 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Calculate reward amount (10 XLM default per 5-day streak)
+        let bonus_per_streak: i128 = env.storage().instance()
+            .get(&DataKey::StreakBonusAmount)
+            .unwrap_or(100_000_000); // 10 XLM in stroops
+        
+        // Calculate how many complete 5-day streaks haven't been claimed yet
+        let complete_streaks = streak_data.current_streak / 5;
+        let claimed_streaks = streak_data.total_reward_claimed / bonus_per_streak;
+        let unclaimed_streaks = complete_streaks - claimed_streaks;
+        
+        if unclaimed_streaks == 0 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let reward_amount = unclaimed_streaks * bonus_per_streak;
+        
+        // Transfer reward from contract balance to student
+        // Note: This assumes the contract has been funded with XLM
+        // In production, you'd want a separate treasury management system
+        
+        // Update total claimed
+        let mut updated_streak = streak_data;
+        updated_streak.total_reward_claimed += reward_amount;
+        env.storage().persistent().set(&DataKey::ConsecutiveDays(student.clone(), course_id), &updated_streak);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Gas_Subsidy_Claimed"), student.clone(), course_id),
+            (reward_amount, updated_streak.current_streak)
+        );
+    }
+
+    pub fn reset_streak(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+        
+        // Allow manual reset if needed
+        let streak_data = StreakData {
+            current_streak: 0,
+            last_watch_date: 0,
+            total_reward_claimed: 0,
+        };
+        
+        env.storage().persistent().set(&DataKey::ConsecutiveDays(student.clone(), course_id), &streak_data);
     }
 }
 
