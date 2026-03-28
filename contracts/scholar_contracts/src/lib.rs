@@ -68,6 +68,7 @@ pub enum DataKey {
     GroupPoolAccess(u64, Address), // pool_id, member -> access granted
     ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
     ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
+    TuitionStipendSplit(Address), // student -> TuitionStipendSplit struct
 }
 
 #[contracttype]
@@ -98,6 +99,15 @@ pub struct CourseRegistry {
 #[derive(Clone)]
 pub struct RoyaltySplit {
     pub shares: Vec<(Address, u32)>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct TuitionStipendSplit {
+    pub university_address: Address,
+    pub student_address: Address,
+    pub university_percentage: u32, // Default 70
+    pub student_percentage: u32,    // Default 30
 }
 
 // Research Grant Milestone Escrow structs
@@ -206,17 +216,33 @@ impl ScholarContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&student, &env.current_contract_address(), &actual_cost);
 
-        // Access record uses persistent storage for user-specific data
-        let access_key = DataKey::Access(student.clone(), course_id);
-        let mut access = env.storage().persistent().get(&access_key).unwrap_or(Access {
-            student: student.clone(),
-            course_id,
-            expiry_time: current_time,
-            token: token.clone(),
-            total_watch_time: 0,
-            last_heartbeat: 0,
-            last_purchase_time: 0,
-        });
+        // Apply tuition-stipend split for course payments
+        let (university_share, student_share) = Self::distribute_tuition_stipend_split(
+            &env, 
+            &student, 
+            actual_cost, 
+            &token
+        );
+
+        let mut access = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Access(student.clone(), course_id))
+            .unwrap_or(Access {
+                student: student.clone(),
+                course_id,
+                expiry_time: current_time,
+                token: token.clone(),
+                total_watch_time: 0,
+                last_heartbeat: 0,
+                last_purchase_time: 0,
+            });
+
+        if access.expiry_time > current_time {
+            access.expiry_time += seconds_bought;
+        } else {
+            access.expiry_time = current_time + seconds_bought;
+        }
 
         // Use hardened expiry math
         access.expiry_time = checked_access_expiry(current_time, access.expiry_time, seconds_bought)
@@ -224,8 +250,16 @@ impl ScholarContract {
         
         access.last_purchase_time = current_time;
 
-        env.storage().persistent().set(&access_key, &access);
-        env.storage().persistent().extend_ttl(&access_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        // Distribute royalty for course creators (separate from tuition split)
+        Self::distribute_royalty(&env, course_id, actual_cost, &token);
+        
+        // Emit event with split information
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Access_Purchased"), student.clone(), course_id),
+            (actual_cost, university_share, student_share, seconds_bought)
+        );
+    }
 
         // Distribute royalties
         Self::distribute_royalty(&env, course_id, actual_cost, &token);
@@ -295,6 +329,484 @@ impl ScholarContract {
         false
     }
 
+    pub fn buy_subscription(
+        env: Env,
+        subscriber: Address,
+        course_ids: Vec<u64>,
+        duration_months: u64,
+        amount: i128,
+        token: Address,
+    ) {
+        subscriber.require_auth();
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&subscriber, &env.current_contract_address(), &amount);
+
+        let current_time = env.ledger().timestamp();
+        let month_in_seconds = 30 * 24 * 60 * 60; // Approximate month
+        let expiry_time = current_time + (duration_months * month_in_seconds);
+
+        let subscription = SubscriptionTier {
+            subscriber: subscriber.clone(),
+            expiry_time,
+            course_ids,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscriber.clone()), &subscription);
+    }
+
+    pub fn set_admin(env: Env, admin: Address) {
+        admin.require_auth();
+
+        // Only allow setting admin if not already set
+        let existing_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if existing_admin.is_some() {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    fn is_admin(env: &Env, caller: &Address) -> bool {
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        admin.map_or(false, |a| a == *caller)
+    }
+
+    pub fn set_teacher(env: Env, admin: Address, teacher: Address, status: bool) {
+        admin.require_auth();
+
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IsTeacher(teacher), &status);
+    }
+
+    pub fn fund_scholarship(
+        env: Env,
+        funder: Address,
+        student: Address,
+        amount: i128,
+        token: Address,
+    ) {
+        funder.require_auth();
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&funder, &env.current_contract_address(), &amount);
+
+        // Apply tuition-stipend split if configured
+        let (university_amount, student_amount) = Self::distribute_tuition_stipend_split(
+            &env, 
+            &student, 
+            amount, 
+            &token
+        );
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .unwrap_or(Scholarship {
+                balance: 0,
+                token,
+                unlocked_balance: 0,
+                last_verif: 0,
+                is_paused: false,
+            });
+
+        // Only add the student's portion to scholarship balance
+        scholarship.balance += student_amount;
+        scholarship.unlocked_balance += student_amount; // Assume funded amount is unlocked
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        // Emit Scholarship_Granted event with split information
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "Scholarship_Granted"),
+                funder,
+                student.clone(),
+            ),
+            (amount, university_amount, student_amount)
+        );
+    }
+
+    pub fn transfer_scholarship_to_teacher(
+        env: Env,
+        student: Address,
+        teacher: Address,
+        amount: i128,
+    ) {
+        student.require_auth();
+
+        // Check if teacher is approved
+        let is_approved: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IsTeacher(teacher.clone()))
+            .unwrap_or(false);
+        if !is_approved {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.is_paused {
+            panic!("Scholarship is paused");
+        }
+
+        if scholarship.unlocked_balance < amount {
+            panic!("Insufficient unlocked balance. Need academic verification?");
+        }
+
+        if scholarship.balance < amount {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        scholarship.balance -= amount;
+        scholarship.unlocked_balance -= amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student), &scholarship);
+
+        // Transfer to teacher
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &teacher, &amount);
+    }
+
+    pub fn veto_course_globally(env: Env, admin: Address, course_id: u64, status: bool) {
+        admin.require_auth();
+
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::VetoedCourseGlobal(course_id), &status);
+    }
+
+    pub fn veto_course_access(env: Env, admin: Address, student: Address, course_id: u64) {
+        admin.require_auth();
+
+        // Verify caller is admin
+        let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if stored_admin.is_none() || stored_admin.unwrap() != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Mark course as vetoed for this student
+        env.storage()
+            .persistent()
+            .set(&DataKey::VetoedCourse(student.clone(), course_id), &true);
+
+        // Revoke existing access by setting expiry to 0
+        let access_key = DataKey::Access(student.clone(), course_id);
+        if let Some(mut access) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Access>(&access_key)
+        {
+            access.expiry_time = 0;
+            env.storage().persistent().set(&access_key, &access);
+        }
+
+        // Remove course from subscription if present
+        let sub_key = DataKey::Subscription(student.clone());
+        if let Some(mut subscription) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, SubscriptionTier>(&sub_key)
+        {
+            // Filter out the vetoed course
+            let mut new_course_ids = Vec::new(&env);
+            for i in 0..subscription.course_ids.len() {
+                let cid = subscription.course_ids.get(i).unwrap();
+                if cid != course_id {
+                    new_course_ids.push_back(cid);
+                }
+            }
+            subscription.course_ids = new_course_ids;
+            env.storage().persistent().set(&sub_key, &subscription);
+        }
+    }
+
+    pub fn pro_rated_refund(env: Env, student: Address, course_id: u64) -> i128 {
+        student.require_auth();
+
+        let access_key = DataKey::Access(student.clone(), course_id);
+        let mut access = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Access>(&access_key)
+            .expect("No access record found");
+
+        let current_time = env.ledger().timestamp();
+
+        if current_time > access.last_purchase_time + EARLY_DROP_WINDOW_SECONDS {
+            panic!("Refund only available within 5 minutes of purchase");
+        }
+
+        if current_time >= access.expiry_time {
+            return 0;
+        }
+
+        let remaining_seconds = access.expiry_time - current_time;
+        let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
+        let refund_amount = (remaining_seconds as i128) * rate;
+
+        // Reset expiry to revoke access
+        access.expiry_time = 0;
+        env.storage().persistent().set(&access_key, &access);
+
+        let client = token::Client::new(&env, &access.token);
+        client.transfer(&env.current_contract_address(), &student, &refund_amount);
+
+        refund_amount
+    }
+
+    pub fn calculate_remaining_airtime(env: Env, student: Address) -> u64 {
+        let flow_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BaseRate)
+            .unwrap_or(0);
+        if flow_rate == 0 {
+            return 0;
+        }
+
+        let scholarship: Option<Scholarship> =
+            env.storage().persistent().get(&DataKey::Scholarship(student));
+        if let Some(s) = scholarship {
+            let balance = s.unlocked_balance;
+            if balance > 0 {
+                return (balance / flow_rate) as u64;
+            }
+        }
+        0
+    }
+
+    pub fn withdraw_scholarship(env: Env, student: Address, amount: i128) {
+        student.require_auth();
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.is_paused {
+            panic!("Scholarship is paused");
+        }
+
+        if scholarship.unlocked_balance < amount {
+            panic!("Insufficient unlocked balance. Need academic verification?");
+        }
+
+        if scholarship.balance < amount {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        scholarship.balance -= amount;
+        scholarship.unlocked_balance -= amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        // Transfer back to student
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &student, &amount);
+    }
+
+    pub fn set_academic_oracle(env: Env, admin: Address, oracle: Address) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::AcademicOracle, &oracle);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Academic_Oracle_Updated"), admin),
+            oracle,
+        );
+    }
+
+    pub fn get_academic_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AcademicOracle)
+    }
+
+    pub fn pause_scholarship(env: Env, admin: Address, student: Address, status: bool) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Unauthorized");
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        scholarship.is_paused = status;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Scholarship_Status_Updated"), student),
+            status,
+        );
+    }
+
+    pub fn verify_academic_progress(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AcademicOracle)
+            .expect("Academic Oracle not set");
+
+        // Call the external oracle
+        // Assumption: Oracle has a function `check_status(student: Address, course_id: u64) -> u32`
+        // 0: Fail, 1: Success, 2: Incomplete
+        let status: u32 = env.invoke_contract(
+            &oracle,
+            &Symbol::new(&env, "check_status"),
+            (student.clone(), course_id).into_val(&env),
+        );
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if status == 1 {
+            // Success - unlock next 30 days of drips
+            let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(0);
+            let thirty_days_seconds: i128 = 30 * 24 * 3600;
+            let unlock_amount = thirty_days_seconds * base_rate;
+
+            scholarship.unlocked_balance += unlock_amount;
+            scholarship.last_verif = env.ledger().timestamp();
+            scholarship.is_paused = false;
+
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Scholarship_Drip_Unlocked"), student.clone()),
+                unlock_amount,
+            );
+        } else {
+            // Fail or Incomplete - pause stream
+            scholarship.is_paused = true;
+
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Scholarship_Paused_By_Oracle"), student.clone()),
+                status,
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student), &scholarship);
+    }
+
+    pub fn set_royalty_split(
+        env: Env,
+        caller: Address,
+        course_id: u64,
+        shares: Vec<(Address, u32)>,
+    ) {
+        caller.require_auth();
+
+        // Verify caller is admin or course creator
+        let course_info: Option<CourseInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CourseInfo(course_id));
+        let is_admin = Self::is_admin(&env, &caller);
+        let is_creator = course_info.map_or(false, |info| info.creator == caller);
+
+        if !is_admin && !is_creator {
+            panic!("Unauthorized")
+        }
+
+        // Validate total = 100%
+        let total: u32 = shares.iter().map(|(_, p)| p).sum();
+        if total != 100 {
+            panic!("Royalty Share does not sum to 100")
+        }
+
+        let split = RoyaltySplit { shares };
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoyaltySplit(course_id), &split);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RoyaltySplit(course_id),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    pub fn get_royalty_split(env: Env, course_id: u64) -> Option<RoyaltySplit> {
+        let key = DataKey::RoyaltySplit(course_id);
+        let split = env.storage().persistent().get(&key);
+        if split.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        split
+    }
+
     fn distribute_royalty(env: &Env, course_id: u64, total_amount: i128, token: &Address) {
         if let Some(split) = env.storage().persistent().get::<_, RoyaltySplit>(&DataKey::RoyaltySplit(course_id)) {
             let client = token::Client::new(env, token);
@@ -304,6 +816,114 @@ impl ScholarContract {
                     client.transfer(&env.current_contract_address(), &recipient, &share);
                 }
             }
+        }
+    }
+
+    // Tuition-Stipend Split Functions
+    
+    pub fn set_tuition_stipend_split(
+        env: Env,
+        admin: Address,
+        student: Address,
+        university_address: Address,
+        university_percentage: u32,
+        student_percentage: u32,
+    ) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Validate percentages sum to 100
+        if university_percentage + student_percentage != 100 {
+            panic!("Percentages must sum to 100");
+        }
+        
+        let split_config = TuitionStipendSplit {
+            university_address,
+            student_address: student.clone(),
+            university_percentage,
+            student_percentage,
+        };
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::TuitionStipendSplit(student), &split_config);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TuitionStipendSplit(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "TuitionStipendSplit_Configured"), admin, student),
+            (university_address, university_percentage, student_percentage)
+        );
+    }
+    
+    pub fn get_tuition_stipend_split(env: Env, student: Address) -> Option<TuitionStipendSplit> {
+        let key = DataKey::TuitionStipendSplit(student);
+        let split = env.storage().persistent().get(&key);
+        if split.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        split
+    }
+    
+    pub fn distribute_tuition_stipend_split(
+        env: &Env,
+        student: &Address,
+        total_amount: i128,
+        token: &Address,
+    ) -> (i128, i128) {
+        let split: Option<TuitionStipendSplit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TuitionStipendSplit(student));
+        
+        let client = token::Client::new(env, token);
+        
+        if let Some(config) = split {
+            // Calculate university share (70% by default)
+            let university_share = (total_amount * config.university_percentage as i128) / 100;
+            let student_share = (total_amount * config.student_percentage as i128) / 100;
+            
+            // Transfer to university first (priority payment)
+            if university_share > 0 {
+                client.transfer(&env.current_contract_address(), &config.university_address, &university_share);
+            }
+            
+            // Transfer remainder to student
+            if student_share > 0 {
+                client.transfer(&env.current_contract_address(), &config.student_address, &student_share);
+            }
+            
+            // Emit split distribution event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "TuitionStipendSplit_Distributed"), student, config.university_address),
+                (university_share, student_share)
+            );
+            
+            (university_share, student_share)
+        } else {
+            // No split configured, transfer full amount to student
+            client.transfer(&env.current_contract_address(), student, &total_amount);
+            (0, total_amount)
         }
     }
 
@@ -1418,3 +2038,6 @@ impl ScholarContract {
         );
     }
 }
+
+mod test;
+mod tuition_stipend_split_tests;
