@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec, Symbol};
+use core::convert::TryFrom;
+use expiry_math::{checked_access_expiry, checked_subscription_expiry};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -57,20 +59,50 @@ pub struct ScholarContract;
 
 #[contractimpl]
 impl ScholarContract {
-    pub fn init(env: Env, base_rate: i128, discount_threshold: u64, discount_percentage: u64, min_deposit: i128, heartbeat_interval: u64) {
+    pub fn init(
+        env: Env,
+        base_rate: i128,
+        discount_threshold: u64,
+        discount_percentage: u64,
+        min_deposit: i128,
+        heartbeat_interval: u64,
+    ) {
         env.storage().instance().set(&DataKey::BaseRate, &base_rate);
-        env.storage().instance().set(&DataKey::DiscountThreshold, &discount_threshold);
-        env.storage().instance().set(&DataKey::DiscountPercentage, &discount_percentage);
-        env.storage().instance().set(&DataKey::MinDeposit, &min_deposit);
-        env.storage().instance().set(&DataKey::HeartbeatInterval, &heartbeat_interval);
+        env.storage()
+            .instance()
+            .set(&DataKey::DiscountThreshold, &discount_threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::DiscountPercentage, &discount_percentage);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinDeposit, &min_deposit);
+        env.storage()
+            .instance()
+            .set(&DataKey::HeartbeatInterval, &heartbeat_interval);
     }
 
     fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
-        let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(1);
-        let discount_threshold: u64 = env.storage().instance().get(&DataKey::DiscountThreshold).unwrap_or(3600); // 1 hour default
-        let discount_percentage: u64 = env.storage().instance().get(&DataKey::DiscountPercentage).unwrap_or(10); // 10% default
-        
-        let access: Access = env.storage().instance().get(&DataKey::Access(student.clone(), course_id))
+        let base_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BaseRate)
+            .unwrap_or(1);
+        let discount_threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DiscountThreshold)
+            .unwrap_or(3600); // 1 hour default
+        let discount_percentage: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DiscountPercentage)
+            .unwrap_or(10); // 10% default
+
+        let access: Access = env
+            .storage()
+            .instance()
+            .get(&DataKey::Access(student.clone(), course_id))
             .unwrap_or(Access {
                 student: student.clone(),
                 course_id,
@@ -79,7 +111,7 @@ impl ScholarContract {
                 total_watch_time: 0,
                 last_heartbeat: 0,
             });
-        
+
         if access.total_watch_time >= discount_threshold {
             let discount = (base_rate * discount_percentage as i128) / 100;
             base_rate - discount
@@ -92,9 +124,16 @@ impl ScholarContract {
         student.require_auth();
 
         // Check minimum deposit requirement
-        let min_deposit: i128 = env.storage().instance().get(&DataKey::MinDeposit).unwrap_or(0);
+        let min_deposit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinDeposit)
+            .unwrap_or(0);
         if amount < min_deposit {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
 
         // Check if student has active subscription
@@ -106,10 +145,25 @@ impl ScholarContract {
         client.transfer(&student, &env.current_contract_address(), &amount);
 
         let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
-        let seconds_bought = (amount / rate) as u64;
+        if rate <= 0 {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        let seconds_bought = u64::try_from(amount / rate).unwrap_or_else(|_| {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        });
         let current_time = env.ledger().timestamp();
 
-        let mut access = env.storage().instance().get(&DataKey::Access(student.clone(), course_id))
+        let mut access = env
+            .storage()
+            .instance()
+            .get(&DataKey::Access(student.clone(), course_id))
             .unwrap_or(Access {
                 student: student.clone(),
                 course_id,
@@ -119,26 +173,41 @@ impl ScholarContract {
                 last_heartbeat: 0,
             });
 
-        if access.expiry_time > current_time {
-            access.expiry_time += seconds_bought;
-        } else {
-            access.expiry_time = current_time + seconds_bought;
-        }
-        
-        env.storage().instance().set(&DataKey::Access(student, course_id), &access);
+        access.expiry_time =
+            checked_access_expiry(current_time, access.expiry_time, seconds_bought).unwrap_or_else(
+                || {
+                    env.panic_with_error((
+                        soroban_sdk::xdr::ScErrorType::Contract,
+                        soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                    ));
+                },
+            );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Access(student, course_id), &access);
     }
 
     pub fn set_course_duration(env: Env, course_id: u64, duration: u64) {
-        env.storage().instance().set(&DataKey::CourseDuration(course_id), &duration);
+        env.storage()
+            .instance()
+            .set(&DataKey::CourseDuration(course_id), &duration);
     }
 
     pub fn heartbeat(env: Env, student: Address, course_id: u64, _signature: soroban_sdk::Bytes) {
         student.require_auth();
-        
+
         let current_time = env.ledger().timestamp();
-        let heartbeat_interval: u64 = env.storage().instance().get(&DataKey::HeartbeatInterval).unwrap_or(60);
-        
-        let mut access = env.storage().instance().get(&DataKey::Access(student.clone(), course_id))
+        let heartbeat_interval: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::HeartbeatInterval)
+            .unwrap_or(60);
+
+        let mut access = env
+            .storage()
+            .instance()
+            .get(&DataKey::Access(student.clone(), course_id))
             .unwrap_or(Access {
                 student: student.clone(),
                 course_id,
@@ -151,81 +220,128 @@ impl ScholarContract {
         // Session validation logic
         let sig_len = _signature.len();
         if sig_len != 32 && _signature != soroban_sdk::Bytes::from_slice(&env, b"test_signature") {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
 
-        let active_session = access.last_heartbeat > 0 && (current_time - access.last_heartbeat) <= heartbeat_interval;
-        let stored_session: Option<soroban_sdk::Bytes> = env.storage().instance().get(&DataKey::Session(student.clone()));
+        let active_session = access.last_heartbeat > 0
+            && (current_time - access.last_heartbeat) <= heartbeat_interval;
+        let stored_session: Option<soroban_sdk::Bytes> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Session(student.clone()));
 
         if let Some(stored_hash) = stored_session {
             if stored_hash != _signature {
                 if active_session {
-                    env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+                    env.panic_with_error((
+                        soroban_sdk::xdr::ScErrorType::Contract,
+                        soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                    ));
                 } else {
-                    env.storage().instance().set(&DataKey::Session(student.clone()), &_signature);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Session(student.clone()), &_signature);
                 }
             }
         } else {
-            env.storage().instance().set(&DataKey::Session(student.clone()), &_signature);
+            env.storage()
+                .instance()
+                .set(&DataKey::Session(student.clone()), &_signature);
         }
-        
+
         // Verify heartbeat timing
-        if access.last_heartbeat > 0 && (current_time - access.last_heartbeat) < heartbeat_interval {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        if access.last_heartbeat > 0 && (current_time - access.last_heartbeat) < heartbeat_interval
+        {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
-        
+
         // Update watch time and heartbeat
         if access.last_heartbeat > 0 {
             access.total_watch_time += current_time - access.last_heartbeat;
         }
         access.last_heartbeat = current_time;
-        
+
         // Verify access is still valid
         if current_time >= access.expiry_time {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
 
         // SBT Minting Trigger logic
-        let course_duration: u64 = env.storage().instance().get(&DataKey::CourseDuration(course_id)).unwrap_or(0);
+        let course_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CourseDuration(course_id))
+            .unwrap_or(0);
         if course_duration > 0 && access.total_watch_time >= course_duration {
-            let is_minted: bool = env.storage().instance().get(&DataKey::SbtMinted(student.clone(), course_id)).unwrap_or(false);
+            let is_minted: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::SbtMinted(student.clone(), course_id))
+                .unwrap_or(false);
             if !is_minted {
                 // Trigger SBT Minting Event
                 #[allow(deprecated)]
                 env.events().publish(
                     (Symbol::new(&env, "SBT_Mint"), student.clone(), course_id),
-                    course_id
+                    course_id,
                 );
-                env.storage().instance().set(&DataKey::SbtMinted(student.clone(), course_id), &true);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::SbtMinted(student.clone(), course_id), &true);
             }
         }
-        
-        env.storage().instance().set(&DataKey::Access(student, course_id), &access);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Access(student, course_id), &access);
     }
 
     pub fn is_sbt_minted(env: Env, student: Address, course_id: u64) -> bool {
-        env.storage().instance().get(&DataKey::SbtMinted(student, course_id)).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&DataKey::SbtMinted(student, course_id))
+            .unwrap_or(false)
     }
 
     pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
         // Check if course is globally vetoed
-        let is_globally_vetoed: bool = env.storage().instance().get(&DataKey::VetoedCourseGlobal(course_id)).unwrap_or(false);
+        let is_globally_vetoed: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::VetoedCourseGlobal(course_id))
+            .unwrap_or(false);
         if is_globally_vetoed {
             return false;
         }
 
         // Check if course is vetoed for this student
-        let is_vetoed: bool = env.storage().instance().get(&DataKey::VetoedCourse(student.clone(), course_id)).unwrap_or(false);
+        let is_vetoed: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::VetoedCourse(student.clone(), course_id))
+            .unwrap_or(false);
         if is_vetoed {
             return false;
         }
-        
+
         // Check subscription first
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
             return true;
         }
-        
-        let access: Access = env.storage().instance().get(&DataKey::Access(student.clone(), course_id))
+
+        let access: Access = env
+            .storage()
+            .instance()
+            .get(&DataKey::Access(student.clone(), course_id))
             .unwrap_or(Access {
                 student: student.clone(),
                 course_id,
@@ -234,13 +350,16 @@ impl ScholarContract {
                 total_watch_time: 0,
                 last_heartbeat: 0,
             });
-            
+
         env.ledger().timestamp() < access.expiry_time
     }
 
     fn has_active_subscription(env: Env, student: Address, course_id: u64) -> bool {
-        let subscription: Option<SubscriptionTier> = env.storage().instance().get(&DataKey::Subscription(student.clone()));
-        
+        let subscription: Option<SubscriptionTier> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(student.clone()));
+
         if let Some(sub) = subscription {
             let current_time = env.ledger().timestamp();
             if current_time < sub.expiry_time && sub.course_ids.contains(&course_id) {
@@ -250,86 +369,138 @@ impl ScholarContract {
         false
     }
 
-    pub fn buy_subscription(env: Env, subscriber: Address, course_ids: Vec<u64>, duration_months: u64, amount: i128, token: Address) {
+    pub fn buy_subscription(
+        env: Env,
+        subscriber: Address,
+        course_ids: Vec<u64>,
+        duration_months: u64,
+        amount: i128,
+        token: Address,
+    ) {
         subscriber.require_auth();
-        
+
         let client = token::Client::new(&env, &token);
         client.transfer(&subscriber, &env.current_contract_address(), &amount);
-        
+
         let current_time = env.ledger().timestamp();
-        let month_in_seconds = 30 * 24 * 60 * 60; // Approximate month
-        let expiry_time = current_time + (duration_months * month_in_seconds);
-        
+        let expiry_time = checked_subscription_expiry(current_time, duration_months)
+            .unwrap_or_else(|| {
+                env.panic_with_error((
+                    soroban_sdk::xdr::ScErrorType::Contract,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                ));
+            });
+
         let subscription = SubscriptionTier {
             subscriber: subscriber.clone(),
             expiry_time,
             course_ids,
         };
-        
-        env.storage().instance().set(&DataKey::Subscription(subscriber.clone()), &subscription);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Subscription(subscriber.clone()), &subscription);
     }
 
     pub fn set_admin(env: Env, admin: Address) {
         admin.require_auth();
-        
+
         // Only allow setting admin if not already set
         let existing_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing_admin.is_some() {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
-        
+
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
     pub fn set_teacher(env: Env, admin: Address, teacher: Address, status: bool) {
         admin.require_auth();
-        
+
         // Verify caller is admin
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
         if stored_admin != admin {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
-        
-        env.storage().instance().set(&DataKey::IsTeacher(teacher), &status);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::IsTeacher(teacher), &status);
     }
 
-    pub fn fund_scholarship(env: Env, funder: Address, student: Address, amount: i128, token: Address) {
+    pub fn fund_scholarship(
+        env: Env,
+        funder: Address,
+        student: Address,
+        amount: i128,
+        token: Address,
+    ) {
         funder.require_auth();
-        
+
         let client = token::Client::new(&env, &token);
         client.transfer(&funder, &env.current_contract_address(), &amount);
-        
-        let mut scholarship: Scholarship = env.storage().instance()
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .instance()
             .get(&DataKey::Scholarship(student.clone()))
-            .unwrap_or(Scholarship {
-                balance: 0,
-                token,
-            });
-            
+            .unwrap_or(Scholarship { balance: 0, token });
+
         scholarship.balance += amount;
-        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
+        env.storage()
+            .instance()
+            .set(&DataKey::Scholarship(student), &scholarship);
     }
 
-    pub fn transfer_scholarship_to_teacher(env: Env, student: Address, teacher: Address, amount: i128) {
+    pub fn transfer_scholarship_to_teacher(
+        env: Env,
+        student: Address,
+        teacher: Address,
+        amount: i128,
+    ) {
         student.require_auth();
-        
+
         // Check if teacher is approved
-        let is_approved: bool = env.storage().instance().get(&DataKey::IsTeacher(teacher.clone())).unwrap_or(false);
+        let is_approved: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::IsTeacher(teacher.clone()))
+            .unwrap_or(false);
         if !is_approved {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
-        
-        let mut scholarship: Scholarship = env.storage().instance()
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .instance()
             .get(&DataKey::Scholarship(student.clone()))
             .expect("No scholarship found");
-            
+
         if scholarship.balance < amount {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
-        
+
         scholarship.balance -= amount;
-        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
-        
+        env.storage()
+            .instance()
+            .set(&DataKey::Scholarship(student), &scholarship);
+
         // Transfer to teacher
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &teacher, &amount);
@@ -337,38 +508,56 @@ impl ScholarContract {
 
     pub fn veto_course_globally(env: Env, admin: Address, course_id: u64, status: bool) {
         admin.require_auth();
-        
+
         // Verify caller is admin
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
         if stored_admin != admin {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
-        
-        env.storage().instance().set(&DataKey::VetoedCourseGlobal(course_id), &status);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VetoedCourseGlobal(course_id), &status);
     }
 
     pub fn veto_course_access(env: Env, admin: Address, student: Address, course_id: u64) {
         admin.require_auth();
-        
+
         // Verify caller is admin
         let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if stored_admin.is_none() || stored_admin.unwrap() != admin {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
-        
+
         // Mark course as vetoed for this student
-        env.storage().instance().set(&DataKey::VetoedCourse(student.clone(), course_id), &true);
-        
+        env.storage()
+            .instance()
+            .set(&DataKey::VetoedCourse(student.clone(), course_id), &true);
+
         // Revoke existing access by setting expiry to 0
         let access_key = DataKey::Access(student.clone(), course_id);
         if let Some(mut access) = env.storage().instance().get::<DataKey, Access>(&access_key) {
             access.expiry_time = 0;
             env.storage().instance().set(&access_key, &access);
         }
-        
+
         // Remove course from subscription if present
         let sub_key = DataKey::Subscription(student.clone());
-        if let Some(mut subscription) = env.storage().instance().get::<DataKey, SubscriptionTier>(&sub_key) {
+        if let Some(mut subscription) = env
+            .storage()
+            .instance()
+            .get::<DataKey, SubscriptionTier>(&sub_key)
+        {
             // Filter out the vetoed course
             let mut new_course_ids = Vec::new(&env);
             for i in 0..subscription.course_ids.len() {
@@ -383,12 +572,17 @@ impl ScholarContract {
     }
 
     pub fn calculate_remaining_airtime(env: Env, student: Address) -> u64 {
-        let flow_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(0);
+        let flow_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BaseRate)
+            .unwrap_or(0);
         if flow_rate == 0 {
             return 0;
         }
-        
-        let scholarship: Option<Scholarship> = env.storage().instance().get(&DataKey::Scholarship(student));
+
+        let scholarship: Option<Scholarship> =
+            env.storage().instance().get(&DataKey::Scholarship(student));
         if let Some(s) = scholarship {
             let balance = s.balance;
             if balance > 0 {
