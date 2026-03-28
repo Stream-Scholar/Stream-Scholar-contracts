@@ -10,6 +10,7 @@ pub enum Event {
 }
 
 
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Access {
@@ -28,6 +29,72 @@ pub struct Scholarship {
     pub balance: i128,
     pub token: Address,
 
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StudyGroup {
+    pub group_id: u64,
+    pub members: Vec<Address>, // Exactly 3 members
+    pub grant_stream: Stream, // The shared grant stream
+    pub collateral_per_member: i128, // XLM amount each member must lock
+    pub is_active: bool,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MemberCollateral {
+    pub member: Address,
+    pub group_id: u64,
+    pub collateral_amount: i128,
+    pub is_locked: bool,
+    pub is_slashed: bool,
+    pub is_paused: bool, // Whether member's share is paused
+    pub locked_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VoteRecord {
+    pub voter: Address,
+    pub target_member: Address,
+    pub group_id: u64,
+    pub vote_type: Symbol, // "pause" or "slash"
+    pub voted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GpaRecord {
+    pub student: Address,
+    pub gpa_scaled: u64, // GPA * 100 (e.g., 3.5 GPA = 350)
+    pub verified_at: u64,
+    pub academic_period: Symbol, // e.g., "fall2024", "spring2025"
+    pub verifier_address: Address, // Academic institution oracle
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FlowRateAdjustment {
+    pub student: Address,
+    pub base_rate: i128,
+    pub adjusted_rate: i128,
+    pub gpa_scaled: u64,
+    pub adjustment_timestamp: u64,
+    pub max_grant_amount: i128,
+    pub total_distributed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BudgetTracker {
+    pub student: Address,
+    pub max_grant_amount: i128,
+    pub total_distributed: i128,
+    pub current_flow_rate: i128,
+    pub last_accumulation_time: u64,
+    pub accumulated_amount: i128,
+}
 
 #[contracttype]
 pub enum DataKey {
@@ -823,6 +890,569 @@ impl ScholarContract {
     }
 
 
+    }
+
+    // Study Group Collateral Functions for Joint Grants
+    
+    pub fn create_study_group(env: Env, funder: Address, members: Vec<Address>, collateral_per_member: i128, amount_per_second: i128, token: Address) -> u64 {
+        funder.require_auth();
+        
+        // Verify exactly 3 members
+        if members.len() != 3 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Get next group ID
+        let group_id: u64 = env.storage().instance().get(&DataKey::NextGroupId).unwrap_or(1);
+        env.storage().instance().set(&DataKey::NextGroupId, &(group_id + 1));
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Create the shared grant stream
+        let grant_stream = Stream {
+            funder: funder.clone(),
+            student: Address::from_array(&[0; 32]), // Placeholder address for group
+            amount_per_second,
+            total_deposited: 0,
+            total_withdrawn: 0,
+            start_time: current_time,
+            is_active: true,
+            geographic_restriction: None,
+        };
+        
+        // Create study group
+        let study_group = StudyGroup {
+            group_id,
+            members: members.clone(),
+            grant_stream,
+            collateral_per_member,
+            is_active: false, // Not active until all collateral is locked
+            created_at: current_time,
+        };
+        
+        env.storage().persistent().set(&DataKey::StudyGroup(group_id), &study_group);
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "STUDY_GROUP_CREATED"), group_id, funder),
+            collateral_per_member
+        );
+        
+        group_id
+    }
+    
+    pub fn lock_collateral(env: Env, member: Address, group_id: u64, token: Address) {
+        member.require_auth();
+        
+        // Get study group
+        let mut study_group: StudyGroup = env.storage().persistent()
+            .get(&DataKey::StudyGroup(group_id))
+            .expect("Study group not found");
+        
+        // Verify member is part of the group
+        if !study_group.members.contains(&member) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Check if collateral already locked
+        let collateral_key = DataKey::MemberCollateral(member.clone());
+        if env.storage().persistent().has(&collateral_key) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Transfer collateral to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&member, &env.current_contract_address(), &study_group.collateral_per_member);
+        
+        // Create collateral record
+        let collateral = MemberCollateral {
+            member: member.clone(),
+            group_id,
+            collateral_amount: study_group.collateral_per_member,
+            is_locked: true,
+            is_slashed: false,
+            is_paused: false,
+            locked_at: env.ledger().timestamp(),
+        };
+        
+        env.storage().persistent().set(&collateral_key, &collateral);
+        
+        // Check if all members have locked collateral
+        let mut all_locked = true;
+        for i in 0..study_group.members.len() {
+            let member_addr = study_group.members.get(i).unwrap();
+            let member_collateral_key = DataKey::MemberCollateral(member_addr);
+            if !env.storage().persistent().has(&member_collateral_key) {
+                all_locked = false;
+                break;
+            }
+        }
+        
+        // Activate group if all collateral is locked
+        if all_locked {
+            study_group.is_active = true;
+            env.storage().persistent().set(&DataKey::StudyGroup(group_id), &study_group);
+        }
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "COLLATERAL_LOCKED"), member, group_id),
+            study_group.collateral_per_member
+        );
+    }
+    
+    pub fn vote_to_pause_member(env: Env, voter: Address, target_member: Address, group_id: u64) {
+        voter.require_auth();
+        
+        // Verify voter is in the group and not the target
+        let study_group: StudyGroup = env.storage().persistent()
+            .get(&DataKey::StudyGroup(group_id))
+            .expect("Study group not found");
+        
+        if !study_group.members.contains(&voter) || voter == target_member {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Verify target member is in the group
+        if !study_group.members.contains(&target_member) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Check if already voted
+        let vote_key = DataKey::VoteRecord(voter.clone(), target_member.clone(), group_id);
+        if env.storage().persistent().has(&vote_key) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Record vote
+        let vote = VoteRecord {
+            voter: voter.clone(),
+            target_member: target_member.clone(),
+            group_id,
+            vote_type: Symbol::new(&env, "pause"),
+            voted_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&vote_key, &vote);
+        
+        // Count votes
+        let vote_count_key = DataKey::GroupVoteCount(group_id, target_member.clone(), Symbol::new(&env, "pause"));
+        let current_count: u64 = env.storage().instance().get(&vote_count_key).unwrap_or(0);
+        let new_count = current_count + 1;
+        env.storage().instance().set(&vote_count_key, &new_count);
+        
+        // If 2 votes reached, pause the member
+        if new_count >= 2 {
+            let collateral_key = DataKey::MemberCollateral(target_member.clone());
+            let mut collateral: MemberCollateral = env.storage().persistent()
+                .get(&collateral_key)
+                .expect("Member collateral not found");
+            
+            collateral.is_paused = true;
+            env.storage().persistent().set(&collateral_key, &collateral);
+            
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "MEMBER_PAUSED"), target_member, group_id),
+                new_count
+            );
+        }
+    }
+    
+    pub fn vote_to_slash_collateral(env: Env, voter: Address, target_member: Address, group_id: u64, replacement_member: Address) {
+        voter.require_auth();
+        
+        // Verify voter is in the group and not the target
+        let study_group: StudyGroup = env.storage().persistent()
+            .get(&DataKey::StudyGroup(group_id))
+            .expect("Study group not found");
+        
+        if !study_group.members.contains(&voter) || voter == target_member {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Verify target member is paused (must be paused before slashing)
+        let collateral_key = DataKey::MemberCollateral(target_member.clone());
+        let collateral: MemberCollateral = env.storage().persistent()
+            .get(&collateral_key)
+            .expect("Member collateral not found");
+        
+        if !collateral.is_paused {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Check if already voted
+        let vote_key = DataKey::VoteRecord(voter.clone(), target_member.clone(), group_id);
+        if env.storage().persistent().has(&vote_key) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Record vote
+        let vote = VoteRecord {
+            voter: voter.clone(),
+            target_member: target_member.clone(),
+            group_id,
+            vote_type: Symbol::new(&env, "slash"),
+            voted_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&vote_key, &vote);
+        
+        // Count votes
+        let vote_count_key = DataKey::GroupVoteCount(group_id, target_member.clone(), Symbol::new(&env, "slash"));
+        let current_count: u64 = env.storage().instance().get(&vote_count_key).unwrap_or(0);
+        let new_count = current_count + 1;
+        env.storage().instance().set(&vote_count_key, &new_count);
+        
+        // If 2 votes reached, slash collateral and replace member
+        if new_count >= 2 {
+            // Transfer slashed collateral to group fund (for replacement member setup)
+            let client = token::Client::new(&env, &Address::from_array(&[0; 32])); // Use XLM token address
+            client.transfer(&env.current_contract_address(), &env.current_contract_address(), &collateral.collateral_amount);
+            
+            // Mark collateral as slashed
+            let mut updated_collateral = collateral;
+            updated_collateral.is_slashed = true;
+            env.storage().persistent().set(&collateral_key, &updated_collateral);
+            
+            // Update study group members (replace target with replacement)
+            let mut updated_group = study_group;
+            for i in 0..updated_group.members.len() {
+                let member_addr = updated_group.members.get(i).unwrap();
+                if *member_addr == target_member {
+                    updated_group.members.set(i, replacement_member.clone());
+                    break;
+                }
+            }
+            env.storage().persistent().set(&DataKey::StudyGroup(group_id), &updated_group);
+            
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "COLLATERAL_SLASHED"), target_member, replacement_member),
+                collateral.collateral_amount
+            );
+        }
+    }
+    
+    pub fn withdraw_from_group_stream(env: Env, member: Address, group_id: u64, token: Address) -> i128 {
+        member.require_auth();
+        
+        // Get study group
+        let study_group: StudyGroup = env.storage().persistent()
+            .get(&DataKey::StudyGroup(group_id))
+            .expect("Study group not found");
+        
+        // Verify member is part of the group
+        if !study_group.members.contains(&member) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Check if member's collateral is not paused
+        let collateral_key = DataKey::MemberCollateral(member.clone());
+        let collateral: MemberCollateral = env.storage().persistent()
+            .get(&collateral_key)
+            .expect("Member collateral not found");
+        
+        if collateral.is_paused {
+            return 0; // No withdrawal if paused
+        }
+        
+        // Calculate member's share (1/3 of total stream)
+        let current_time = env.ledger().timestamp();
+        let elapsed_seconds = current_time - study_group.grant_stream.start_time;
+        let total_accrued = elapsed_seconds as i128 * study_group.grant_stream.amount_per_second;
+        let member_share = total_accrued / 3; // Equal split among 3 members
+        
+        // Check available balance (consider previous withdrawals)
+        let total_withdrawn_by_all = study_group.grant_stream.total_withdrawn;
+        let available_total = (study_group.grant_stream.total_deposited - total_withdrawn_by_all).min(total_accrued);
+        let available_member_share = available_total / 3;
+        
+        if available_member_share <= 0 {
+            return 0;
+        }
+        
+        // Transfer to member
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &member, &available_member_share);
+        
+        // Update group's total withdrawn
+        let mut updated_stream = study_group.grant_stream;
+        updated_stream.total_withdrawn += available_member_share;
+        
+        let mut updated_group = study_group;
+        updated_group.grant_stream = updated_stream;
+        env.storage().persistent().set(&DataKey::StudyGroup(group_id), &updated_group);
+        
+        available_member_share
+    }
+    
+    pub fn get_member_status(env: Env, member: Address) -> (bool, bool, bool) { // (is_locked, is_paused, is_slashed)
+        if let Some(collateral) = env.storage().persistent().get::<DataKey, MemberCollateral>(&DataKey::MemberCollateral(member)) {
+            (collateral.is_locked, collateral.is_paused, collateral.is_slashed)
+        } else {
+            (false, false, false)
+        }
+    }
+    
+    pub fn get_study_group_info(env: Env, group_id: u64) -> StudyGroup {
+        env.storage().persistent()
+            .get(&DataKey::StudyGroup(group_id))
+            .expect("Study group not found")
+    }
+
+    // GPA-Based Flow Rate and Math Verification Functions
+    
+    pub fn set_academic_oracle(env: Env, admin: Address, oracle_address: Address) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::AcademicOracle(oracle_address), &true);
+    }
+    
+    pub fn verify_gpa(env: Env, student: Address, gpa_scaled: u64, academic_period: Symbol, verifier_address: Address) {
+        student.require_auth();
+        
+        // Verify oracle is authorized
+        let is_authorized: bool = env.storage().instance().get(&DataKey::AcademicOracle(verifier_address.clone())).unwrap_or(false);
+        if !is_authorized {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Verify GPA is within valid range (0.0 to 4.0 scaled)
+        if gpa_scaled > GPA_SCALE {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        let gpa_record = GpaRecord {
+            student: student.clone(),
+            gpa_scaled,
+            verified_at: current_time,
+            academic_period,
+            verifier_address,
+        };
+        
+        env.storage().persistent().set(&DataKey::GpaRecord(student), &gpa_record);
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GPA_VERIFIED"), student),
+            gpa_scaled
+        );
+    }
+    
+    pub fn calculate_gpa_adjusted_flow_rate(env: Env, student: Address, base_rate: i128, max_grant_amount: i128) -> i128 {
+        // Get student's GPA record
+        let gpa_record: GpaRecord = env.storage().persistent()
+            .get(&DataKey::GpaRecord(student.clone()))
+            .expect("GPA record not found");
+        
+        // Verify GPA meets minimum threshold
+        if gpa_record.gpa_scaled < MIN_GPA_THRESHOLD {
+            return 0; // No flow rate if below minimum GPA
+        }
+        
+        // Calculate GPA bonus: linear scaling from 0% at 2.0 to 20% at 4.0
+        let gpa_above_min = gpa_record.gpa_scaled - MIN_GPA_THRESHOLD;
+        let gpa_range = GPA_SCALE - MIN_GPA_THRESHOLD;
+        let bonus_percentage = (gpa_above_min as i128 * MAX_GPA_BONUS) / gpa_range as i128;
+        
+        // Apply bonus to base rate
+        let adjusted_rate = base_rate + ((base_rate * bonus_percentage) / 1000);
+        
+        // Ensure adjusted rate doesn't exceed budget constraints
+        let monthly_rate = adjusted_rate * (30 * 24 * 60 * 60) as i128;
+        if monthly_rate > max_grant_amount {
+            // Cap the rate to stay within budget
+            max_grant_amount / (30 * 24 * 60 * 60) as i128
+        } else {
+            adjusted_rate
+        }
+    }
+    
+    pub fn create_gpa_adjusted_stream(env: Env, funder: Address, student: Address, base_rate: i128, max_grant_amount: i128, token: Address) {
+        funder.require_auth();
+        
+        // Verify student has verified GPA
+        if !env.storage().persistent().has(&DataKey::GpaRecord(student.clone())) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Calculate GPA-adjusted flow rate
+        let adjusted_rate = Self::calculate_gpa_adjusted_flow_rate(env.clone(), student.clone(), base_rate, max_grant_amount);
+        
+        if adjusted_rate <= 0 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Create flow rate adjustment record
+        let adjustment = FlowRateAdjustment {
+            student: student.clone(),
+            base_rate,
+            adjusted_rate,
+            gpa_scaled: {
+                let gpa_record: GpaRecord = env.storage().persistent()
+                    .get(&DataKey::GpaRecord(student.clone()))
+                    .expect("GPA record not found");
+                gpa_record.gpa_scaled
+            },
+            adjustment_timestamp: current_time,
+            max_grant_amount,
+            total_distributed: 0,
+        };
+        env.storage().persistent().set(&DataKey::FlowRateAdjustment(student.clone()), &adjustment);
+        
+        // Create budget tracker
+        let budget_tracker = BudgetTracker {
+            student: student.clone(),
+            max_grant_amount,
+            total_distributed: 0,
+            current_flow_rate: adjusted_rate,
+            last_accumulation_time: current_time,
+            accumulated_amount: 0,
+        };
+        env.storage().persistent().set(&DataKey::BudgetTracker(student.clone()), &budget_tracker);
+        
+        // Create the stream with adjusted rate
+        Self::create_stream(env.clone(), funder, student.clone(), adjusted_rate, token, None);
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GPA_FLOW_ADJUSTED"), student),
+            adjusted_rate
+        );
+    }
+    
+    pub fn verify_budget_invariant(env: Env, student: Address) -> bool {
+        let budget_tracker: BudgetTracker = env.storage().persistent()
+            .get(&DataKey::BudgetTracker(student.clone()))
+            .expect("Budget tracker not found");
+        
+        let current_time = env.ledger().timestamp();
+        let elapsed_time = current_time - budget_tracker.last_accumulation_time;
+        
+        // Calculate theoretical accumulated amount since last check
+        let new_accumulation = elapsed_time as i128 * budget_tracker.current_flow_rate;
+        let total_accumulated = budget_tracker.accumulated_amount + new_accumulation;
+        
+        // Core invariant: Sum(FlowRate * DeltaTime) <= Max_Grant_Amount
+        let invariant_holds = total_accumulated <= budget_tracker.max_grant_amount;
+        
+        if invariant_holds {
+            // Update the accumulated amount
+            let mut updated_tracker = budget_tracker;
+            updated_tracker.last_accumulation_time = current_time;
+            updated_tracker.accumulated_amount = total_accumulated;
+            env.storage().persistent().set(&DataKey::BudgetTracker(student), &updated_tracker);
+        }
+        
+        invariant_holds
+    }
+    
+    pub fn withdraw_with_math_verification(env: Env, student: Address, funder: Address, token: Address) -> i128 {
+        student.require_auth();
+        
+        // First verify the budget invariant
+        if !Self::verify_budget_invariant(env.clone(), student.clone()) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Perform standard withdrawal
+        let amount = Self::withdraw_from_stream(env.clone(), student.clone(), funder.clone(), token.clone());
+        
+        if amount > 0 {
+            // Update budget tracker
+            let mut budget_tracker: BudgetTracker = env.storage().persistent()
+                .get(&DataKey::BudgetTracker(student.clone()))
+                .expect("Budget tracker not found");
+            
+            budget_tracker.total_distributed += amount;
+            env.storage().persistent().set(&DataKey::BudgetTracker(student), &budget_tracker);
+            
+            // Update flow rate adjustment record
+            let mut adjustment: FlowRateAdjustment = env.storage().persistent()
+                .get(&DataKey::FlowRateAdjustment(student.clone()))
+                .expect("Flow rate adjustment not found");
+            
+            adjustment.total_distributed += amount;
+            env.storage().persistent().set(&DataKey::FlowRateAdjustment(student), &adjustment);
+            
+            // Final invariant check after withdrawal
+            if !Self::verify_budget_invariant(env.clone(), student.clone()) {
+                env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            }
+        }
+        
+        amount
+    }
+    
+    pub fn update_gpa_and_flow(env: Env, student: Address, new_gpa_scaled: u64, academic_period: Symbol, verifier_address: Address) {
+        // This allows for dynamic flow rate adjustment based on new GPA
+        Self::verify_gpa(env.clone(), student.clone(), new_gpa_scaled, academic_period, verifier_address);
+        
+        // Get current flow rate adjustment
+        let adjustment: FlowRateAdjustment = env.storage().persistent()
+            .get(&DataKey::FlowRateAdjustment(student.clone()))
+            .expect("Flow rate adjustment not found");
+        
+        // Calculate new adjusted rate
+        let new_adjusted_rate = Self::calculate_gpa_adjusted_flow_rate(
+            env.clone(), 
+            student.clone(), 
+            adjustment.base_rate, 
+            adjustment.max_grant_amount
+        );
+        
+        // Update the stream with new rate
+        let stream_key = DataKey::Stream(adjustment.student.clone(), student.clone());
+        let mut stream: Stream = env.storage().persistent()
+            .get(&stream_key)
+            .expect("Stream not found");
+        
+        stream.amount_per_second = new_adjusted_rate;
+        env.storage().persistent().set(&stream_key, &stream);
+        
+        // Update budget tracker
+        let mut budget_tracker: BudgetTracker = env.storage().persistent()
+            .get(&DataKey::BudgetTracker(student.clone()))
+            .expect("Budget tracker not found");
+        
+        budget_tracker.current_flow_rate = new_adjusted_rate;
+        env.storage().persistent().set(&DataKey::BudgetTracker(student), &budget_tracker);
+        
+        // Update flow rate adjustment record
+        let mut updated_adjustment = adjustment;
+        updated_adjustment.adjusted_rate = new_adjusted_rate;
+        updated_adjustment.gpa_scaled = new_gpa_scaled;
+        updated_adjustment.adjustment_timestamp = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::FlowRateAdjustment(student), &updated_adjustment);
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GPA_FLOW_UPDATED"), student),
+            new_adjusted_rate
+        );
+    }
+    
+    pub fn get_budget_status(env: Env, student: Address) -> (i128, i128, i128, bool) { // (max_grant, total_distributed, remaining, invariant_holds)
+        let budget_tracker: BudgetTracker = env.storage().persistent()
+            .get(&DataKey::BudgetTracker(student.clone()))
+            .expect("Budget tracker not found");
+        
+        let invariant_holds = Self::verify_budget_invariant(env.clone(), student.clone());
+        let remaining = budget_tracker.max_grant_amount - budget_tracker.total_distributed;
+        
+        (budget_tracker.max_grant_amount, budget_tracker.total_distributed, remaining, invariant_holds)
+    }
+    
+    pub fn get_gpa_info(env: Env, student: Address) -> Option<GpaRecord> {
+        env.storage().persistent().get(&DataKey::GpaRecord(student))
     }
 }
 
