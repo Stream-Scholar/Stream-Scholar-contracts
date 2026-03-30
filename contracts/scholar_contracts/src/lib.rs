@@ -1,5 +1,10 @@
 #![no_std]
 
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short,
+    Address, Bytes, Env, Symbol, Vec, token,
+};
+
 // Constants for ledger bump and GPA bonus calculations
 const LEDGER_BUMP_THRESHOLD: u32 = 7776000; // ~90 days
 const LEDGER_BUMP_EXTEND: u32 = 7776000;   // ~90 days
@@ -36,6 +41,9 @@ const NATIVE_XLM_RESERVE: i128 = 2_0000000; // 2 XLM in stroops
 const DEFAULT_TAX_RATE_BPS: u32 = 0; // 0% default tax
 const ESTIMATED_GAS_FEE: i128 = 500000; // 0.05 XLM in stroops
 
+// Issue #115: Emergency Protocol Pause for University Admins
+const SECURITY_HOLD_DURATION: u64 = 604800; // 7 days in seconds
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -57,6 +65,9 @@ pub enum Event {
     ProbationStarted(Address, u64), // student, warning_period_end
     ProbationEnded(Address, bool), // student, recovered
     StreamRevoked(Address), // student
+    // Issue #115: Emergency Protocol Pause events
+    SecurityHoldTriggered(Address, u64), // university, expires_at
+    SecurityHoldLifted(Address, u64),    // university, lifted_at
 }
 
 
@@ -261,6 +272,10 @@ pub enum DataKey {
     TaxRate,
     // Issue #122: On-Chain Graduation Credential Registry
     GraduationRegistry(Address), // student -> GraduateProfile
+    // Issue #115: Emergency Protocol Pause
+    UniversityAdmin(Address),   // university_address -> registrar Address
+    SecurityHold(Address),      // university_address -> SecurityHold struct
+    StudentUniversity(Address), // student_address -> university_address
 }
 
 #[contracttype]
@@ -340,6 +355,18 @@ pub struct GraduateProfile {
     pub graduation_date: u64,
     pub final_gpa: u64,
     pub completed_scholarships: Vec<Address>, // List of funder addresses
+}
+
+// Issue #115: Emergency Protocol Pause for University Admins
+#[contracttype]
+#[derive(Clone)]
+pub struct SecurityHold {
+    pub university: Address,
+    pub triggered_by: Address,  // The university registrar/admin who triggered the hold
+    pub triggered_at: u64,
+    pub expires_at: u64,        // triggered_at + SECURITY_HOLD_DURATION (7 days)
+    pub is_active: bool,
+    pub reason: Symbol,
 }
 
 // Multi-Sig Academic Board Review structs
@@ -512,6 +539,24 @@ impl ScholarContract {
 
         if scholarship.is_paused || scholarship.is_disputed {
             panic!("Scholarship is paused or disputed");
+        }
+
+        // Issue #115: Block withdrawals during an active university security hold
+        if let Some(university) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::StudentUniversity(student.clone()))
+        {
+            if let Some(hold) = env
+                .storage()
+                .persistent()
+                .get::<_, SecurityHold>(&DataKey::SecurityHold(university))
+            {
+                let now = env.ledger().timestamp();
+                if hold.is_active && now < hold.expires_at {
+                    panic!("Scholarship withdrawals are suspended: university security hold is active");
+                }
+            }
         }
 
         // Issue #128: Check for final release lock
@@ -835,5 +880,150 @@ impl ScholarContract {
             .get(&DataKey::GraduationRegistry(student))
     }
 
+    // --- Issue #115: Emergency_Protocol_Pause_for_University_Admins ---
+
+    /// Assigns a university admin (registrar) for a given university address.
+    /// Only the platform admin can call this.
+    pub fn register_university_admin(
+        env: Env,
+        platform_admin: Address,
+        university: Address,
+        university_admin: Address,
+    ) {
+        platform_admin.require_auth();
+        if !Self::is_admin(&env, &platform_admin) {
+            panic!("Not authorized: caller is not the platform admin");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UniversityAdmin(university), &university_admin);
+    }
+
+    /// Associates a student with a university so they fall under that university's
+    /// security hold. Called by the university admin when onboarding a scholar.
+    pub fn register_student_university(
+        env: Env,
+        university_admin: Address,
+        university: Address,
+        student: Address,
+    ) {
+        university_admin.require_auth();
+        let registered_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UniversityAdmin(university.clone()))
+            .expect("University has no registered admin");
+        if registered_admin != university_admin {
+            panic!("Not authorized: caller is not the university admin");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::StudentUniversity(student), &university);
+    }
+
+    /// Triggers a 7-day Security Hold for all scholarships belonging to a university.
+    /// Only the registered university admin (registrar) can call this.
+    /// While a hold is active, no student associated with the university can withdraw.
+    pub fn trigger_security_hold(
+        env: Env,
+        university_admin: Address,
+        university: Address,
+        reason: Symbol,
+    ) {
+        university_admin.require_auth();
+        let registered_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UniversityAdmin(university.clone()))
+            .expect("University has no registered admin");
+        if registered_admin != university_admin {
+            panic!("Not authorized: caller is not the university admin");
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now
+            .checked_add(SECURITY_HOLD_DURATION)
+            .expect("Timestamp overflow");
+
+        let hold = SecurityHold {
+            university: university.clone(),
+            triggered_by: university_admin,
+            triggered_at: now,
+            expires_at,
+            is_active: true,
+            reason,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SecurityHold(university.clone()), &hold);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::SecurityHold(university.clone()),
+                LEDGER_BUMP_THRESHOLD,
+                LEDGER_BUMP_EXTEND,
+            );
+
+        env.events().publish(
+            (symbol_short!("sec_hold"), symbol_short!("trigger")),
+            (university, expires_at),
+        );
+    }
+
+    /// Lifts an active Security Hold before its 7-day expiry.
+    /// Only the university admin who triggered it (or any registered admin for that university)
+    /// can lift the hold once the incident is resolved.
+    pub fn lift_security_hold(
+        env: Env,
+        university_admin: Address,
+        university: Address,
+    ) {
+        university_admin.require_auth();
+        let registered_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UniversityAdmin(university.clone()))
+            .expect("University has no registered admin");
+        if registered_admin != university_admin {
+            panic!("Not authorized: caller is not the university admin");
+        }
+
+        let mut hold: SecurityHold = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SecurityHold(university.clone()))
+            .expect("No active security hold found for this university");
+
+        if !hold.is_active {
+            panic!("Security hold is already inactive");
+        }
+
+        hold.is_active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::SecurityHold(university.clone()), &hold);
+
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (symbol_short!("sec_hold"), symbol_short!("lift")),
+            (university, now),
+        );
+    }
+
+    /// Returns the current SecurityHold record for a university, if any.
+    pub fn get_security_hold(env: Env, university: Address) -> Option<SecurityHold> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SecurityHold(university))
+    }
+
+    // Private helper: checks whether an address is the platform admin
+    fn is_admin(env: &Env, addr: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Admin)
+            .map(|a| a == *addr)
+            .unwrap_or(false)
     }
 }
