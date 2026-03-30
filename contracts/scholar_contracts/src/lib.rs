@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec, Symbol};
+use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Val, Vec, Symbol};
 
 // Constants for TTL management and time windows
 const LEDGER_BUMP_THRESHOLD: u32 = 15552000; // ~180 days in ledgers
@@ -504,7 +504,7 @@ impl ScholarContract {
     pub fn withdraw_scholarship(env: Env, student: Address, amount: i128) {
         student.require_auth();
         
-        let mut scholarship: Scholarship = env.storage().instance()
+        let mut scholarship: Scholarship = env.storage().persistent()
             .get(&DataKey::Scholarship(student.clone()))
             .expect("No scholarship found");
             
@@ -513,11 +513,54 @@ impl ScholarContract {
         }
         
         scholarship.balance -= amount;
-        env.storage().instance().set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage().persistent().set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage().persistent().extend_ttl(&DataKey::Scholarship(student.clone()), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
         
         // Transfer back to student
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &student, &amount);
+    }
+
+    pub fn claim_scholarship_for_tuition(
+        env: Env,
+        student: Address,
+        amount: i128,
+        destination_token: Address,
+        dex_contract: Address,
+        min_received: i128,
+        path: Vec<Address>,
+    ) -> i128 {
+        student.require_auth();
+
+        if amount <= 0 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+
+        let mut scholarship: Scholarship = env.storage().persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.balance < amount {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+
+        scholarship.balance -= amount;
+        env.storage().persistent().set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage().persistent().extend_ttl(&DataKey::Scholarship(student.clone()), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+
+        let source_token = scholarship.token.clone();
+        let source_client = token::Client::new(&env, &source_token);
+        source_client.transfer(&env.current_contract_address(), &dex_contract, &amount);
+
+        let mut args = Vec::new(&env);
+        args.push_back(source_token.into_val(&env));
+        args.push_back(amount.into_val(&env));
+        args.push_back(student.clone().into_val(&env));
+        args.push_back(destination_token.into_val(&env));
+        args.push_back(min_received.into_val(&env));
+        args.push_back(path.into_val(&env));
+
+        env.invoke_contract(&dex_contract, &Symbol::new(&env, "path_payment_strict_receive"), args)
     }
     
     // Course Registry Management Functions
