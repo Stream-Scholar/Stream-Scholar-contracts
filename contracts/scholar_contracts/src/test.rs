@@ -1514,7 +1514,7 @@ fn test_board_pause_request_and_execution() {
     client.init_deans_council(&admin, &council_members, &2);
 
     // Fund a scholarship for the student
-    client.fund_scholarship(&funder, &student, &1000, &token_address.address());
+    client.fund_scholarship(&funder, &student, &1000, &token_address.address(), &Symbol::new(&env, "default_roadmap"));
 
     // Verify initial state - not disputed
     assert!(!client.is_disputed(&student));
