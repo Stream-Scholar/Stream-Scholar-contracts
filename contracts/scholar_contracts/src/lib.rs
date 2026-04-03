@@ -192,6 +192,17 @@ pub struct GeneralExcellenceFund {
     pub last_updated: u64,
 }
 
+// Issue #106: Research Bonus Fund — treasury yield redirected to top-5% student bonuses
+#[contracttype]
+#[derive(Clone)]
+pub struct ResearchBonusFund {
+    pub total_balance: i128,
+    pub token: Address,
+    pub total_accrued: i128,   // cumulative yield deposited
+    pub total_distributed: i128,
+    pub last_distribution: u64,
+}
+
 // Issue #93: Scholarship Probation Cooling-Off Logic structs
 #[contracttype]
 #[derive(Clone)]
@@ -278,10 +289,9 @@ pub enum DataKey {
     DepartmentVault(Address),              // department_manager -> DepartmentVault
     DepartmentDelegation(Address, Address), // (department_manager, student) -> DepartmentDelegation
     DepartmentDelegationCount(Address),    // department_manager -> u64 (number of active delegations)
-    // Issue #124: Gas Fee Subsidy
-    GasTreasuryToken,
-    SubsidizedStudentCount,
-    HasReceivedSubsidy(Address),
+    // Issue #106: Research Bonus Fund entries
+    ResearchBonusFund,
+    SurpriseBonusRecipient(u64), // rank -> student Address
 }
 
 #[contracttype]
@@ -1121,4 +1131,142 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .get(&DataKey::DepartmentDelegation(manager, student))
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #106: Research Bonus Fund
+    // Yield accrued by the scholarship treasury is redirected here and paid out
+    // as a "Surprise Bonus" to the top 5% of students at year-end.
+    // -------------------------------------------------------------------------
+
+    /// Initialize the Research Bonus Fund. Must be called once by admin.
+    pub fn init_research_bonus_fund(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+        if env.storage().instance().has(&DataKey::ResearchBonusFund) {
+            panic!("Already initialized");
+        }
+        env.storage().instance().set(
+            &DataKey::ResearchBonusFund,
+            &ResearchBonusFund {
+                total_balance: 0,
+                token,
+                total_accrued: 0,
+                total_distributed: 0,
+                last_distribution: 0,
+            },
+        );
+    }
+
+    /// Deposit yield earned by the scholarship treasury into the Research Bonus Fund.
+    /// The caller (admin/keeper) must have already approved the token transfer.
+    pub fn accrue_treasury_yield(env: Env, admin: Address, yield_amount: i128) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+        if yield_amount <= 0 {
+            panic!("Yield must be positive");
+        }
+
+        let mut fund: ResearchBonusFund = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResearchBonusFund)
+            .expect("Research Bonus Fund not initialized");
+
+        let client = token::Client::new(&env, &fund.token);
+        client.transfer(&admin, &env.current_contract_address(), &yield_amount);
+
+        fund.total_balance += yield_amount;
+        fund.total_accrued += yield_amount;
+        env.storage().instance().set(&DataKey::ResearchBonusFund, &fund);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "YieldAccrued"), admin),
+            yield_amount,
+        );
+    }
+
+    /// Register a student address for a leaderboard rank so the bonus
+    /// distributor can resolve them. Called by admin when the leaderboard is settled.
+    pub fn register_surprise_bonus_recipient(env: Env, admin: Address, rank: u64, student: Address) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::SurpriseBonusRecipient(rank), &student);
+    }
+
+    /// Distribute the accumulated Research Bonus Fund as a Surprise Bonus to
+    /// the top 5% of students on the leaderboard (minimum 1 recipient).
+    /// Each eligible student receives an equal share of the fund balance.
+    pub fn distribute_surprise_bonus(env: Env, admin: Address) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+
+        let mut fund: ResearchBonusFund = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResearchBonusFund)
+            .expect("Research Bonus Fund not initialized");
+
+        if fund.total_balance <= 0 {
+            panic!("No balance to distribute");
+        }
+
+        let leaderboard_size: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LeaderboardSize)
+            .unwrap_or(0);
+
+        if leaderboard_size == 0 {
+            panic!("Leaderboard is empty");
+        }
+
+        // Top 5%, at least 1 recipient
+        let recipient_count: u64 = core::cmp::max(1, leaderboard_size * 5 / 100);
+        let bonus_per_student: i128 = fund.total_balance / recipient_count as i128;
+
+        if bonus_per_student == 0 {
+            panic!("Bonus per student rounds to zero");
+        }
+
+        let client = token::Client::new(&env, &fund.token);
+
+        for rank in 1..=recipient_count {
+            if let Some(student) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::SurpriseBonusRecipient(rank))
+            {
+                client.transfer(&env.current_contract_address(), &student, &bonus_per_student);
+
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "SurpriseBonusPaid"), student),
+                    (rank, bonus_per_student),
+                );
+            }
+        }
+
+        let total_paid = bonus_per_student * recipient_count as i128;
+        fund.total_balance -= total_paid;
+        fund.total_distributed += total_paid;
+        fund.last_distribution = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::ResearchBonusFund, &fund);
+    }
+
+    /// Read-only view of the Research Bonus Fund state.
+    pub fn get_research_bonus_fund(env: Env) -> Option<ResearchBonusFund> {
+        env.storage().instance().get(&DataKey::ResearchBonusFund)
+    }
 }
