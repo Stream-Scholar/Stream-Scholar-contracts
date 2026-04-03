@@ -1,5 +1,10 @@
 #![no_std]
 
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short,
+    Address, Bytes, Env, Symbol, Vec, token,
+};
+
 // Constants for ledger bump and GPA bonus calculations
 const LEDGER_BUMP_THRESHOLD: u32 = 7776000; // ~90 days
 const LEDGER_BUMP_EXTEND: u32 = 7776000;   // ~90 days
@@ -62,6 +67,9 @@ pub enum Event {
     ProbationStarted(Address, u64), // student, warning_period_end
     ProbationEnded(Address, bool), // student, recovered
     StreamRevoked(Address), // student
+    // Issue #115: Emergency Protocol Pause events
+    SecurityHoldTriggered(Address, u64), // university, expires_at
+    SecurityHoldLifted(Address, u64),    // university, lifted_at
 }
 
 
@@ -249,7 +257,7 @@ pub enum DataKey {
     DaoVote(Address, Bytes), // voter, logic_hash -> DaoVote struct
     LogicUpgradeProposal(u64), // proposal_id -> LogicUpgradeProposal struct
     ProposalCounter,
-    DaoMembers(Vec<Address>),
+    DaoMembersKey,
     // Task 3: Scholarship Registry entries
     ScholarshipRegistry(Address), // university_address -> ScholarshipRegistry struct
     UniversityContractIndex(Address, u64), // university, index -> contract_id
@@ -353,6 +361,18 @@ pub struct GraduateProfile {
     pub graduation_date: u64,
     pub final_gpa: u64,
     pub completed_scholarships: Vec<Address>, // List of funder addresses
+}
+
+// Issue #115: Emergency Protocol Pause for University Admins
+#[contracttype]
+#[derive(Clone)]
+pub struct SecurityHold {
+    pub university: Address,
+    pub triggered_by: Address,  // The university registrar/admin who triggered the hold
+    pub triggered_at: u64,
+    pub expires_at: u64,        // triggered_at + SECURITY_HOLD_DURATION (7 days)
+    pub is_active: bool,
+    pub reason: Symbol,
 }
 
 // Multi-Sig Academic Board Review structs
@@ -552,6 +572,24 @@ impl ScholarContract {
 
         if scholarship.is_paused || scholarship.is_disputed {
             panic!("Scholarship is paused or disputed");
+        }
+
+        // Issue #115: Block withdrawals during an active university security hold
+        if let Some(university) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::StudentUniversity(student.clone()))
+        {
+            if let Some(hold) = env
+                .storage()
+                .persistent()
+                .get::<_, SecurityHold>(&DataKey::SecurityHold(university))
+            {
+                let now = env.ledger().timestamp();
+                if hold.is_active && now < hold.expires_at {
+                    panic!("Scholarship withdrawals are suspended: university security hold is active");
+                }
+            }
         }
 
         // Issue #128: Check for final release lock
@@ -927,187 +965,151 @@ impl ScholarContract {
             .get(&DataKey::GraduationRegistry(student))
     }
 
-    // --- Issue #116: Sub-Scholarship_Delegation_for_Departments ---
+    // --- Issue #115: Emergency_Protocol_Pause_for_University_Admins ---
 
-    /// Main Donor grants "Manager Rights" over a token pool to a department sub-admin.
-    /// The donor transfers `pool_amount` tokens into the contract and designates
-    /// `manager` (e.g. CS Dean) as the sole authority over that pool.
-    pub fn grant_manager_rights(
+    /// Assigns a university admin (registrar) for a given university address.
+    /// Only the platform admin can call this.
+    pub fn register_university_admin(
         env: Env,
-        donor: Address,
-        manager: Address,
-        pool_amount: i128,
-        token: Address,
+        platform_admin: Address,
+        university: Address,
+        university_admin: Address,
     ) {
-        donor.require_auth();
-        assert!(pool_amount > 0, "Pool amount must be positive");
+        platform_admin.require_auth();
+        if !Self::is_admin(&env, &platform_admin) {
+            panic!("Not authorized: caller is not the platform admin");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UniversityAdmin(university), &university_admin);
+    }
 
-        // Ensure no vault already exists for this manager (one vault per manager)
-        assert!(
-            !env.storage()
-                .persistent()
-                .has(&DataKey::DepartmentVault(manager.clone())),
-            "Manager already has an active vault"
-        );
+    /// Associates a student with a university so they fall under that university's
+    /// security hold. Called by the university admin when onboarding a scholar.
+    pub fn register_student_university(
+        env: Env,
+        university_admin: Address,
+        university: Address,
+        student: Address,
+    ) {
+        university_admin.require_auth();
+        let registered_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UniversityAdmin(university.clone()))
+            .expect("University has no registered admin");
+        if registered_admin != university_admin {
+            panic!("Not authorized: caller is not the university admin");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::StudentUniversity(student), &university);
+    }
 
-        // Pull tokens from donor into the contract
-        let client = token::Client::new(&env, &token);
-        client.transfer(&donor, &env.current_contract_address(), &pool_amount);
+    /// Triggers a 7-day Security Hold for all scholarships belonging to a university.
+    /// Only the registered university admin (registrar) can call this.
+    /// While a hold is active, no student associated with the university can withdraw.
+    pub fn trigger_security_hold(
+        env: Env,
+        university_admin: Address,
+        university: Address,
+        reason: Symbol,
+    ) {
+        university_admin.require_auth();
+        let registered_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UniversityAdmin(university.clone()))
+            .expect("University has no registered admin");
+        if registered_admin != university_admin {
+            panic!("Not authorized: caller is not the university admin");
+        }
 
-        let vault = DepartmentVault {
-            manager: manager.clone(),
-            token,
-            total_allocated: pool_amount,
-            distributed: 0,
+        let now = env.ledger().timestamp();
+        let expires_at = now
+            .checked_add(SECURITY_HOLD_DURATION)
+            .expect("Timestamp overflow");
+
+        let hold = SecurityHold {
+            university: university.clone(),
+            triggered_by: university_admin,
+            triggered_at: now,
+            expires_at,
             is_active: true,
-            created_at: env.ledger().timestamp(),
+            reason,
         };
+
         env.storage()
             .persistent()
-            .set(&DataKey::DepartmentVault(manager.clone()), &vault);
+            .set(&DataKey::SecurityHold(university.clone()), &hold);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::SecurityHold(university.clone()),
+                LEDGER_BUMP_THRESHOLD,
+                LEDGER_BUMP_EXTEND,
+            );
 
-        env.events()
-            .publish((Symbol::new(&env, "vault_created"), manager), pool_amount);
+        env.events().publish(
+            (symbol_short!("sec_hold"), symbol_short!("trigger")),
+            (university, expires_at),
+        );
     }
 
-    /// Manager delegates a specific token amount to a student from their vault.
-    /// The manager can revoke and re-delegate at any time.
-    pub fn delegate_to_student(
+    /// Lifts an active Security Hold before its 7-day expiry.
+    /// Only the university admin who triggered it (or any registered admin for that university)
+    /// can lift the hold once the incident is resolved.
+    pub fn lift_security_hold(
         env: Env,
-        manager: Address,
-        student: Address,
-        amount: i128,
+        university_admin: Address,
+        university: Address,
     ) {
-        manager.require_auth();
-        assert!(amount > 0, "Delegation amount must be positive");
-
-        let mut vault: DepartmentVault = env
+        university_admin.require_auth();
+        let registered_admin: Address = env
             .storage()
             .persistent()
-            .get(&DataKey::DepartmentVault(manager.clone()))
-            .expect("No vault found for this manager");
+            .get(&DataKey::UniversityAdmin(university.clone()))
+            .expect("University has no registered admin");
+        if registered_admin != university_admin {
+            panic!("Not authorized: caller is not the university admin");
+        }
 
-        assert!(vault.is_active, "Vault is not active");
-        assert_eq!(vault.manager, manager, "Caller is not the vault manager");
-
-        let available = vault.total_allocated - vault.distributed;
-        assert!(amount <= available, "Insufficient vault balance");
-
-        // If a delegation already exists for this student, top it up
-        let delegation_key = DataKey::DepartmentDelegation(manager.clone(), student.clone());
-        let mut delegation: DepartmentDelegation = env
+        let mut hold: SecurityHold = env
             .storage()
             .persistent()
-            .get(&delegation_key)
-            .unwrap_or(DepartmentDelegation {
-                manager: manager.clone(),
-                student: student.clone(),
-                amount: 0,
-                claimed: 0,
-                is_active: true,
-                created_at: env.ledger().timestamp(),
-            });
+            .get(&DataKey::SecurityHold(university.clone()))
+            .expect("No active security hold found for this university");
 
-        delegation.amount += amount;
-        delegation.is_active = true;
-        vault.distributed += amount;
+        if !hold.is_active {
+            panic!("Security hold is already inactive");
+        }
 
+        hold.is_active = false;
         env.storage()
             .persistent()
-            .set(&delegation_key, &delegation);
-        env.storage()
-            .persistent()
-            .set(&DataKey::DepartmentVault(manager.clone()), &vault);
+            .set(&DataKey::SecurityHold(university.clone()), &hold);
 
-        env.events()
-            .publish((Symbol::new(&env, "delegated"), manager, student), amount);
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (symbol_short!("sec_hold"), symbol_short!("lift")),
+            (university, now),
+        );
     }
 
-    /// Student claims their delegated tokens from the department vault.
-    pub fn claim_department_delegation(
-        env: Env,
-        manager: Address,
-        student: Address,
-    ) {
-        student.require_auth();
-
-        let delegation_key = DataKey::DepartmentDelegation(manager.clone(), student.clone());
-        let mut delegation: DepartmentDelegation = env
-            .storage()
-            .persistent()
-            .get(&delegation_key)
-            .expect("No delegation found");
-
-        assert!(delegation.is_active, "Delegation has been revoked");
-        assert_eq!(delegation.student, student, "Not the delegation recipient");
-
-        let claimable = delegation.amount - delegation.claimed;
-        assert!(claimable > 0, "Nothing to claim");
-
-        let vault: DepartmentVault = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DepartmentVault(manager.clone()))
-            .expect("Vault not found");
-
-        delegation.claimed += claimable;
+    /// Returns the current SecurityHold record for a university, if any.
+    pub fn get_security_hold(env: Env, university: Address) -> Option<SecurityHold> {
         env.storage()
             .persistent()
-            .set(&delegation_key, &delegation);
-
-        let client = token::Client::new(&env, &vault.token);
-        client.transfer(&env.current_contract_address(), &student, &claimable);
-
-        env.events()
-            .publish((Symbol::new(&env, "del_claimed"), manager, student), claimable);
+            .get(&DataKey::SecurityHold(university))
     }
 
-    /// Manager revokes a student's unclaimed delegation, returning tokens to the vault.
-    pub fn revoke_student_delegation(
-        env: Env,
-        manager: Address,
-        student: Address,
-    ) {
-        manager.require_auth();
-
-        let delegation_key = DataKey::DepartmentDelegation(manager.clone(), student.clone());
-        let mut delegation: DepartmentDelegation = env
-            .storage()
-            .persistent()
-            .get(&delegation_key)
-            .expect("No delegation found");
-
-        assert!(delegation.is_active, "Delegation already revoked");
-        assert_eq!(delegation.manager, manager, "Caller is not the vault manager");
-
-        let unclaimed = delegation.amount - delegation.claimed;
-
-        // Return unclaimed tokens to the vault's available balance
-        let mut vault: DepartmentVault = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DepartmentVault(manager.clone()))
-            .expect("Vault not found");
-
-        vault.distributed -= unclaimed;
-        delegation.is_active = false;
-
+    // Private helper: checks whether an address is the platform admin
+    fn is_admin(env: &Env, addr: &Address) -> bool {
         env.storage()
-            .persistent()
-            .set(&delegation_key, &delegation);
-        env.storage()
-            .persistent()
-            .set(&DataKey::DepartmentVault(manager.clone()), &vault);
-
-        env.events()
-            .publish((Symbol::new(&env, "del_revoked"), manager, student), unclaimed);
-    }
-
-    /// Read-only: returns the vault state for a given manager.
-    pub fn get_department_vault(env: Env, manager: Address) -> Option<DepartmentVault> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DepartmentVault(manager))
+            .instance()
+            .get::<_, Address>(&DataKey::Admin)
+            .map(|a| a == *addr)
+            .unwrap_or(false)
     }
 
     /// Read-only: returns the delegation state for a (manager, student) pair.
@@ -1119,5 +1121,4 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .get(&DataKey::DepartmentDelegation(manager, student))
-    }
 }
