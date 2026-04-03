@@ -1,5 +1,10 @@
 #![no_std]
 
+use soroban_sdk::{contract, contractimpl, contracttype, Env, Address, Symbol, Bytes, Vec, token};
+
+// Import expiry_math utilities from the crate
+use expiry_math::checked_access_expiry;
+
 // Constants for ledger bump and GPA bonus calculations
 const LEDGER_BUMP_THRESHOLD: u32 = 7776000; // ~90 days
 const LEDGER_BUMP_EXTEND: u32 = 7776000;   // ~90 days
@@ -57,6 +62,7 @@ pub enum Event {
     ProbationStarted(Address, u64), // student, warning_period_end
     ProbationEnded(Address, bool), // student, recovered
     StreamRevoked(Address), // student
+    GroupRevocation(Vec<Address>, i128), // students, total_refunded_amount
 }
 
 
@@ -244,7 +250,7 @@ pub enum DataKey {
     DaoVote(Address, Bytes), // voter, logic_hash -> DaoVote struct
     LogicUpgradeProposal(u64), // proposal_id -> LogicUpgradeProposal struct
     ProposalCounter,
-    DaoMembers(Vec<Address>),
+    DaoMembersKey,
     // Task 3: Scholarship Registry entries
     ScholarshipRegistry(Address), // university_address -> ScholarshipRegistry struct
     UniversityContractIndex(Address, u64), // university, index -> contract_id
@@ -866,6 +872,194 @@ impl ScholarContract {
             .get(&DataKey::GraduationRegistry(student))
     }
 
+    /// Issue #126: Implement Batch_Revoke_with_Automatic_Refund_to_Foundation
+    /// Revokes scholarships for multiple students in a single transaction and refunds unvested funds to foundation
+    pub fn batch_revoke_with_automatic_refund(env: Env, admin: Address, students: Vec<Address>) {
+        admin.require_auth();
+        
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+
+        let mut total_refunded: i128 = 0;
+
+        for student in students.clone() {
+            if let Some(mut scholarship) = env.storage().persistent()
+                .get::<_, Scholarship>(&DataKey::Scholarship(student.clone())) {
+                
+                // Calculate unvested balance (total balance minus unlocked balance)
+                let unvested_balance = scholarship.balance - scholarship.unlocked_balance;
+                
+                if unvested_balance > 0 {
+                    // Transfer unvested funds to foundation (admin)
+                    let token_client = soroban_sdk::token::Client::new(&env, &scholarship.token);
+                    token_client.transfer(&env.current_contract_address(), &admin, &unvested_balance);
+                    
+                    total_refunded += unvested_balance;
+                }
+
+                // Mark scholarship as disputed with group revocation reason
+                scholarship.is_disputed = true;
+                scholarship.dispute_reason = Some(Symbol::new(&env, "GROUP_REVOCATION"));
+                scholarship.final_ruling = Some(Symbol::new(&env, "REVOKED"));
+                
+                env.storage().persistent().set(&DataKey::Scholarship(student.clone()), &scholarship);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::Scholarship(student.clone()), 
+                    LEDGER_BUMP_THRESHOLD, 
+                    LEDGER_BUMP_EXTEND
+                );
+            }
+
+            // Clear probation status if exists
+            env.storage().persistent().remove(&DataKey::ProbationStatus(student.clone()));
+        }
+
+        // Emit group revocation event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GroupRevocation"), students),
+            total_refunded
+        );
+    }
+
+    // ==================== HELPER FUNCTIONS ====================
+
+    /// Distribute tuition-stipend split according to configured ratios
+    /// Returns (university_amount, student_amount)
+    fn distribute_tuition_stipend_split(
+        env: &Env,
+        student: &Address,
+        amount: i128,
+        token: &Address,
+    ) -> (i128, i128) {
+        // Get tuition-stipend split configuration
+        let split: Option<TuitionStipendSplit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TuitionStipendSplit(student.clone()));
+
+        if let Some(split_config) = split {
+            let university_amount = (amount * split_config.university_percentage as i128) / 100;
+            let student_amount = amount - university_amount;
+
+            // Transfer university portion to university address
+            if university_amount > 0 {
+                let token_client = token::Client::new(env, token);
+                token_client.transfer(&env.current_contract_address(), &split_config.university_address, &university_amount);
+            }
+
+            (university_amount, student_amount)
+        } else {
+            // Default: 70% to university, 30% to student
+            let university_amount = (amount * 70) / 100;
+            let student_amount = amount - university_amount;
+
+            (university_amount, student_amount)
+        }
+    }
+
+    /// Apply attendance penalty to the scholarship flow rate
+    fn apply_attendance_penalty_to_rate(env: Env, student: Address, rate: i128) -> i128 {
+        // Check if student is on probation or has attendance issues
+        let attendance: Option<AttendanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AttendanceRecord(student.clone()));
+
+        if let Some(record) = attendance {
+            if record.flow_rate_penalty_active {
+                // Apply penalty (e.g., 20% reduction for poor attendance)
+                let penalty_reduction = (rate * 20) / 100;
+                return rate - penalty_reduction;
+            }
+        }
+
+        rate
+    }
+
+    /// Distribute royalties to course creators
+    fn distribute_royalty(env: &Env, course_id: u64, amount: i128, token: &Address) {
+        // Get royalty split configuration for the course
+        let royalty_split: Option<RoyaltySplit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoyaltyKey(course_id));
+
+        if let Some(split) = royalty_split {
+            let total_shares: u32 = {
+                let mut sum = 0u32;
+                for i in 0..split.shares.len() {
+                    let (_, percentage) = split.shares.get(i).expect("Invalid share index");
+                    sum += percentage;
+                }
+                sum
+            };
+
+            if total_shares > 0 {
+                let token_client = token::Client::new(env, token);
+
+                // Distribute to each royalty recipient
+                for i in 0..split.shares.len() {
+                    let (recipient, percentage) = split.shares.get(i).expect("Invalid share index");
+                    let share_amount = (amount * percentage as i128) / (total_shares as i128);
+
+                    if share_amount > 0 {
+                        token_client.transfer(&env.current_contract_address(), &recipient, &share_amount);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Track attendance and apply penalties/bonuses
+    pub fn track_attendance(env: Env, student: Address) {
+        let current_time = env.ledger().timestamp();
+        let attendance_key = DataKey::AttendanceRecord(student.clone());
+
+        let mut record: AttendanceRecord = env
+            .storage()
+            .persistent()
+            .get(&attendance_key)
+            .unwrap_or(AttendanceRecord {
+                student: student.clone(),
+                last_check_in: 0,
+                consecutive_days_present: 0,
+                consecutive_days_absent: 0,
+                total_check_ins: 0,
+                flow_rate_penalty_active: false,
+                penalty_start_time: None,
+            });
+
+        // Update last check-in
+        let last_check_date = record.last_check_in / 86400; // Convert to days
+        let current_date = current_time / 86400;
+
+        if current_date > last_check_date {
+            // New day check-in
+            record.consecutive_days_present += 1;
+            record.consecutive_days_absent = 0; // Reset absent counter
+            record.total_check_ins += 1;
+        }
+
+        record.last_check_in = current_time;
+        env.storage().persistent().set(&attendance_key, &record);
+        env.storage().persistent().extend_ttl(&attendance_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+
+    /// Check if attendance requirement has been met
+    pub fn check_attendance_requirement(env: Env, student: Address, required_days: u64) -> bool {
+        let attendance: Option<AttendanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AttendanceRecord(student));
+
+        if let Some(record) = attendance {
+            return record.consecutive_days_present >= required_days;
+        }
+
+        false
+    }
     // --- Issue #116: Sub-Scholarship_Delegation_for_Departments ---
 
     /// Main Donor grants "Manager Rights" over a token pool to a department sub-admin.
@@ -1058,5 +1252,4 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .get(&DataKey::DepartmentDelegation(manager, student))
-    }
 }
