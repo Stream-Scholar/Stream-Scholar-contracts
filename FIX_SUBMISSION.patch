@@ -1,0 +1,35 @@
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "https://github.com/Stream-Scholar/Stream-Scholar-contracts/blob/main/contracts/StreamScholar.sol";
+
+contract GasRefundIncentive {
+    // Define the percentage of platform fee to refund
+    uint256 public constant REFUND_PERCENTAGE = 5;
+
+    // Define the StreamScholar contract instance
+    StreamScholar public streamScholar;
+
+    // Constructor to initialize the StreamScholar contract instance
+    constructor(address _streamScholar) {
+        streamScholar = StreamScholar(_streamScholar);
+    }
+
+    // Function to finalize and close a stream
+    function finalizeAndClose(uint256 _streamId) public {
+        // Check if the stream is completed and has a balance
+        require(streamScholar.getStreamCompletion(_streamId) == 100, "Stream is not completed");
+        require(streamScholar.getStreamBalance(_streamId) > 0, "Stream has no balance");
+
+        // Calculate the refund amount
+        uint256 refundAmount = (streamScholar.getPlatformFee(_streamId) * REFUND_PERCENTAGE) / 100;
+
+        // Refund the calculated amount to the caller
+        payable(msg.sender).transfer(refundAmount);
+
+        // Close the stream
+        streamScholar.closeStream(_streamId);
+    }
+}
+```
