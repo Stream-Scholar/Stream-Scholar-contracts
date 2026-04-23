@@ -309,6 +309,19 @@ pub enum DataKey {
     SponsorClawbackPolicy(Address), // sponsor address
     ClawbackHistory(Address, Address), // (funder, student)
     ClawbackEventLog(Address, Address, u64), // (funder, student, event_id)
+    StudentProfile(Address),
+    StudentGPA(Address),
+    StudentUniversity(Address),
+    UniversityAdmin(Address),
+    SecurityHold(Address),
+    Milestone(Address, Symbol),
+    CommunityVote(Address),
+    TaxRate,
+    ResearchBonusFund,
+    LeaderboardSize,
+    HasReceivedSubsidy(Address),
+    SubsidizedStudentCount,
+    GraduationRegistry(Address),
 }
 
 #[contracttype]
@@ -1424,6 +1437,337 @@ impl ScholarContract {
         let new_rate = Self::calculate_remaining_airtime(env.clone(), student.clone());
 
         env.events().publish((Symbol::new(&env, "MultiplierApplied"), student, old_rate as i128, new_rate as i128), payload.gpa_bps);
+    }
+
+    // --- Dynamic Sponsor-Clawback Logic Implementation ---
+
+    /// Register a new clawback condition for a scholarship
+    /// Only the sponsor (funder) can register conditions
+    pub fn register_clawback_condition(
+        env: Env,
+        funder: Address,
+        student: Address,
+        trigger_type: ClawbackTriggerType,
+        clawback_percentage: u64,
+        threshold_value: u64,
+    ) {
+        funder.require_auth();
+
+        // Validate clawback percentage
+        if clawback_percentage > MAX_CLAWBACK_PERCENTAGE {
+            panic!("Clawback percentage exceeds maximum");
+        }
+
+        // Verify scholarship exists
+        let scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found for this student");
+
+        if scholarship.funder != funder {
+            panic!("Only the scholarship funder can register clawback conditions");
+        }
+
+        // Generate condition ID based on timestamp
+        let condition_id = env.ledger().timestamp();
+
+        let condition = ClawbackCondition {
+            funder: funder.clone(),
+            student: student.clone(),
+            trigger_type,
+            clawback_percentage,
+            threshold_value,
+            triggered_at: None,
+            executed_at: None,
+            is_active: true,
+            cooldown_period: DEFAULT_CLAWBACK_COOLDOWN,
+            last_clawback_time: 0,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &condition);
+
+        env.events().publish(
+            (Symbol::new(&env, "clawback_registered"), funder, student),
+            (trigger_type, clawback_percentage),
+        );
+    }
+
+    /// Check if clawback conditions are met and trigger clawback if conditions are satisfied
+    pub fn check_and_trigger_clawback(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) -> bool {
+        let condition: ClawbackCondition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id))
+            .expect("Clawback condition not found");
+
+        if !condition.is_active {
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Check cooldown period
+        if now < condition.last_clawback_time + condition.cooldown_period {
+            return false; // Still in cooldown
+        }
+
+        // Check if condition is met based on trigger type
+        let condition_met = match condition.trigger_type {
+            ClawbackTriggerType::GpaThreshold => {
+                Self::check_gpa_threshold(&env, &student, condition.threshold_value)
+            }
+            ClawbackTriggerType::CourseCompletion => {
+                Self::check_course_completion(&env, &student, condition.threshold_value)
+            }
+            ClawbackTriggerType::TimeElapsed => {
+                Self::check_time_elapsed(&env, &condition, condition.threshold_value)
+            }
+            ClawbackTriggerType::ActivityInactive => {
+                Self::check_activity_inactive(&env, &student, condition.threshold_value)
+            }
+            ClawbackTriggerType::CombinedConditions => {
+                Self::check_combined_conditions(&env, &student, &condition)
+            }
+        };
+
+        if condition_met {
+            let mut updated_condition = condition.clone();
+            updated_condition.triggered_at = Some(now);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &updated_condition);
+            return true;
+        }
+
+        false
+    }
+
+    /// Execute clawback of funds from a scholarship
+    pub fn execute_clawback(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) -> i128 {
+        funder.require_auth();
+
+        let mut condition: ClawbackCondition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id))
+            .expect("Clawback condition not found");
+
+        if !condition.is_active {
+            panic!("Clawback condition is not active");
+        }
+
+        if condition.triggered_at.is_none() {
+            panic!("Clawback condition has not been triggered");
+        }
+
+        // Check execution timeout (7 days after trigger)
+        let now = env.ledger().timestamp();
+        let triggered_time = condition.triggered_at.unwrap();
+        if now > triggered_time + CLAWBACK_EXECUTION_TIMEOUT {
+            panic!("Clawback execution window has expired");
+        }
+
+        if condition.executed_at.is_some() {
+            panic!("Clawback has already been executed for this condition");
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.funder != funder {
+            panic!("Only the scholarship funder can execute clawback");
+        }
+
+        // Calculate clawback amount
+        let clawback_amount =
+            (scholarship.balance * condition.clawback_percentage as i128) / 100;
+
+        if clawback_amount <= 0 {
+            panic!("Calculated clawback amount is zero or negative");
+        }
+
+        // Update scholarship
+        scholarship.balance -= clawback_amount;
+        if scholarship.unlocked_balance > clawback_amount {
+            scholarship.unlocked_balance -= clawback_amount;
+        } else {
+            scholarship.unlocked_balance = 0;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        // Update condition
+        condition.executed_at = Some(now);
+        condition.last_clawback_time = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &condition);
+
+        // Record clawback event
+        let event_id = now;
+        let clawback_event = ClawbackEvent {
+            funder: funder.clone(),
+            student: student.clone(),
+            amount_clawed_back: clawback_amount,
+            trigger_type: condition.trigger_type,
+            triggered_at: triggered_time,
+            executed_at: now,
+            remaining_balance: scholarship.balance,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackEventLog(funder.clone(), student.clone(), event_id), &clawback_event);
+
+        // Transfer clawed back funds to funder
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &funder, &clawback_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "clawback_executed"), funder, student),
+            (clawback_amount, scholarship.balance),
+        );
+
+        clawback_amount
+    }
+
+    /// Revoke an active clawback condition (only funder can revoke)
+    pub fn revoke_clawback_condition(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) {
+        funder.require_auth();
+
+        let mut condition: ClawbackCondition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id))
+            .expect("Clawback condition not found");
+
+        if !condition.is_active {
+            panic!("Condition is already revoked");
+        }
+
+        if condition.executed_at.is_some() {
+            panic!("Cannot revoke a condition that has already been executed");
+        }
+
+        condition.is_active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &condition);
+
+        env.events().publish(
+            (Symbol::new(&env, "clawback_revoked"), funder, student),
+            condition_id,
+        );
+    }
+
+    /// Get clawback condition details
+    pub fn get_clawback_condition(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) -> Option<ClawbackCondition> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder, student, condition_id))
+    }
+
+    /// Get clawback event details
+    pub fn get_clawback_event(
+        env: Env,
+        funder: Address,
+        student: Address,
+        event_id: u64,
+    ) -> Option<ClawbackEvent> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClawbackEventLog(funder, student, event_id))
+    }
+
+    // Helper functions for condition checking
+    fn check_gpa_threshold(env: &Env, student: &Address, threshold: u64) -> bool {
+        if let Some(gpa_data) = env
+            .storage()
+            .persistent()
+            .get::<_, StudentGPA>(&DataKey::StudentGPA(student.clone()))
+        {
+            // If GPA falls below threshold, clawback is triggered
+            gpa_data.gpa < threshold
+        } else {
+            false
+        }
+    }
+
+    fn check_course_completion(env: &Env, student: &Address, threshold: u64) -> bool {
+        if let Some(profile) = env
+            .storage()
+            .persistent()
+            .get::<_, StudentProfile>(&DataKey::StudentProfile(student.clone()))
+        {
+            // If courses completed is below threshold, clawback is triggered
+            (profile.courses_completed as u64) < threshold
+        } else {
+            false
+        }
+    }
+
+    fn check_time_elapsed(env: &Env, condition: &ClawbackCondition, threshold_days: u64) -> bool {
+        let threshold_seconds = threshold_days * 86400;
+        if let Some(triggered) = condition.triggered_at {
+            let now = env.ledger().timestamp();
+            now >= triggered + threshold_seconds
+        } else {
+            false
+        }
+    }
+
+    fn check_activity_inactive(env: &Env, student: &Address, inactivity_threshold_days: u64) -> bool {
+        if let Some(profile) = env
+            .storage()
+            .persistent()
+            .get::<_, StudentProfile>(&DataKey::StudentProfile(student.clone()))
+        {
+            let inactivity_seconds = inactivity_threshold_days * 86400;
+            let now = env.ledger().timestamp();
+            let time_since_activity = now.saturating_sub(profile.last_activity);
+            time_since_activity > inactivity_seconds
+        } else {
+            false
+        }
+    }
+
+    fn check_combined_conditions(
+        env: &Env,
+        student: &Address,
+        condition: &ClawbackCondition,
+    ) -> bool {
+        // Combined: GPA below threshold AND inactive for 30 days
+        let gpa_check = Self::check_gpa_threshold(env, student, 25); // 2.5 GPA threshold
+        let inactivity_check = Self::check_activity_inactive(env, student, 30);
+        gpa_check && inactivity_check
     }
 }
 
