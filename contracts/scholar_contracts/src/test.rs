@@ -629,6 +629,7 @@ fn test_calculate_remaining_airtime() {
         university_id: 123,
         start_timestamp: 0,
         end_timestamp: 10000,
+        generated_at: 0,
         nonce: 1,
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
@@ -653,6 +654,7 @@ fn test_calculate_remaining_airtime() {
         student: student.clone(),
         gpa_bps: 400, // 4.0 GPA
         epoch: 1,
+        generated_at: 0,
         nonce: 1,
     };
     client.apply_gpa_multiplier(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &gpa_payload);
@@ -689,6 +691,7 @@ fn test_withdrawal_whitelisting() {
         university_id: 123,
         start_timestamp: 0,
         end_timestamp: 10000,
+        generated_at: 0,
         nonce: 1,
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
@@ -734,10 +737,89 @@ fn test_gpa_pause() {
         student: student.clone(),
         gpa_bps: 200, // 2.0 GPA
         epoch: 1,
+        generated_at: 0,
         nonce: 1,
     };
     client.apply_gpa_multiplier(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &gpa_payload);
 
     // Rate should be 0 (paused)
+    assert_eq!(client.calculate_remaining_airtime(&student), 0);
+}
+
+#[test]
+fn test_verify_enrollment_rejects_stale_oracle_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_oracle_status(&admin, &oracle, &true);
+
+    env.ledger().set_timestamp(ORACLE_STALENESS_THRESHOLD + 1);
+
+    let enrollment = EnrollmentData {
+        student: student.clone(),
+        university_id: 123,
+        start_timestamp: 0,
+        end_timestamp: 10000,
+        generated_at: 0,
+        nonce: 1,
+    };
+
+    let result = env.try_invoke_contract::<(), Error>(
+        &contract_id,
+        &Symbol::new(&env, "verify_enrollment"),
+        (
+            student.clone(),
+            oracle.clone(),
+            soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
+            enrollment,
+        )
+            .into_val(&env),
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_apply_gpa_multiplier_accepts_fresh_oracle_data_at_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_oracle_status(&admin, &oracle, &true);
+
+    env.ledger().set_timestamp(ORACLE_STALENESS_THRESHOLD);
+
+    let gpa_payload = GpaData {
+        student: student.clone(),
+        gpa_bps: 400,
+        epoch: 1,
+        generated_at: 0,
+        nonce: 1,
+    };
+
+    client.apply_gpa_multiplier(
+        &student,
+        &oracle,
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
+        &gpa_payload,
+    );
+
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
 }
