@@ -11,6 +11,7 @@ const LEDGER_BUMP_EXTEND: u32 = 7776000;   // ~90 days
 const GPA_BONUS_THRESHOLD: u64 = 35;       // 3.5 GPA (stored as 35)
 const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // 20% per 0.1 GPA point above threshold
 const EARLY_DROP_WINDOW_SECONDS: u64 = 86400; // 24 hours
+const ORACLE_STALENESS_THRESHOLD: u64 = 172800; // 48 hours
 
 // Leaderboard constants
 const MAX_LEADERBOARD_SIZE: u64 = 100;     // Maximum number of scholars on leaderboard
@@ -65,6 +66,7 @@ pub enum Error {
     InvalidAction = 5,
     ReplayAttack = 6,
     NoScholarship = 7,
+    OracleDataStale = 8,
 }
 
 
@@ -265,6 +267,7 @@ pub struct EnrollmentData {
     pub university_id: u64,
     pub start_timestamp: u64,
     pub end_timestamp: u64,
+    pub generated_at: u64,
     pub nonce: u64,
 }
 
@@ -274,6 +277,7 @@ pub struct GpaData {
     pub student: Address,
     pub gpa_bps: u32, // GPA in basis points (e.g. 380 for 3.8)
     pub epoch: u32,
+    pub generated_at: u64,
     pub nonce: u64,
 }
 
@@ -1270,6 +1274,17 @@ impl ScholarContract {
         env.storage().instance().set(&DataKey::OracleRegistry(oracle), &status);
     }
 
+    fn assert_fresh_oracle_payload(env: &Env, generated_at: u64) {
+        let current_ts = env.ledger().timestamp();
+        if generated_at > current_ts {
+            env.panic_with_error(Error::OracleDataStale);
+        }
+        let delta = current_ts.checked_sub(generated_at).unwrap_or(u64::MAX);
+        if delta > ORACLE_STALENESS_THRESHOLD {
+            env.panic_with_error(Error::OracleDataStale);
+        }
+    }
+
     pub fn verify_enrollment(env: Env, student: Address, oracle: Address, signature: soroban_sdk::BytesN<64>, payload: EnrollmentData) {
         student.require_auth();
 
@@ -1278,6 +1293,9 @@ impl ScholarContract {
         if !is_whitelisted {
             env.panic_with_error(Error::Unauthorized);
         }
+
+        // 1a. Prevent stale oracle data
+        Self::assert_fresh_oracle_payload(&env, payload.generated_at);
 
         // 2. Prevent Replay Attacks
         let stored_nonce: u64 = env.storage().instance().get(&DataKey::Nonce(student.clone())).unwrap_or(0);
@@ -1309,6 +1327,9 @@ impl ScholarContract {
         if !is_whitelisted {
             env.panic_with_error(Error::Unauthorized);
         }
+
+        // 1a. Prevent stale oracle data
+        Self::assert_fresh_oracle_payload(&env, payload.generated_at);
 
         // 2. Prevent Replay/Double-Application in same epoch
         let last_epoch: u32 = env.storage().instance().get(&DataKey::GpaEpoch(student.clone())).unwrap_or(0);
