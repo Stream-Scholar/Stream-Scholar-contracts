@@ -2100,3 +2100,83 @@ fn test_multiple_milestone_claims() {
     // Verify student received all bounties
     assert_eq!(token_client.balance(&student), 850); // 100 initial + 200 + 300 + 250
 }
+
+#[test]
+fn test_private_claim_logic() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Give student some scholarship balance
+    client.buy_access(&student, &1, &500, &token_address.address());
+    // (Note: in current logic, buy_access creates a Scholarship record)
+
+    // 1. Store a commitment
+    let commitment = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    client.store_claim_commitment(&admin, &commitment);
+
+    // 2. Claim private with valid proof
+    let nullifier = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+    let proof_data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 128]); // Placeholder proof
+    let mut public_signals = Vec::new(&env);
+    public_signals.push_back(soroban_sdk::BytesN::from_array(&env, &[3u8; 32]));
+
+    let zk_proof = ZKClaimProof {
+        nullifier: nullifier.clone(),
+        commitment: commitment.clone(),
+        proof: proof_data,
+        public_signals,
+    };
+
+    let balance_before = token::Client::new(&env, &token_address.address()).balance(&student);
+    client.claim_scholarship_private(&student, &100, &zk_proof);
+    let balance_after = token::Client::new(&env, &token_address.address()).balance(&student);
+
+    assert_eq!(balance_after - balance_before, 100);
+
+    // 3. Attempt to reuse nullifier (should fail)
+    let result_reuse = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship_private"),
+        (
+            &student,
+            100i128,
+            &zk_proof,
+        ),
+    );
+    assert!(result_reuse.is_err());
+
+    // 4. Attempt to use invalid commitment
+    let invalid_commitment = soroban_sdk::BytesN::from_array(&env, &[4u8; 32]);
+    let zk_proof_invalid = ZKClaimProof {
+        nullifier: soroban_sdk::BytesN::from_array(&env, &[5u8; 32]), // New nullifier
+        commitment: invalid_commitment,
+        proof: soroban_sdk::Bytes::from_slice(&env, &[0u8; 128]),
+        public_signals: Vec::new(&env),
+    };
+
+    let result_invalid = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship_private"),
+        (
+            &student,
+            100i128,
+            &zk_proof_invalid,
+        ),
+    );
+    assert!(result_invalid.is_err());
+}
+
