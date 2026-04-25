@@ -1,90 +1,275 @@
-# Stream Scholar Contracts
+# Stream-Scholar Contracts
 
-A comprehensive Soroban smart contract system for educational scholarships and academic credentialing on the Stellar network.
+A comprehensive educational platform built on Stellar/Soroban blockchain featuring course streaming, scholarship management, and dynamic Student Profile NFTs.
 
-## Features
+## Overview
 
-### Core Scholarship System
-- **Dynamic Pricing**: Time-based access pricing with discounts for engaged students
-- **Subscription Tiers**: Bulk course access with monthly subscriptions
-- **Heartbeat System**: Active learning verification through periodic check-ins
-- **Minimum Deposits**: Configurable minimum funding requirements
+Stream-Scholar is a decentralized learning platform that combines traditional educational features with modern blockchain technology. The platform includes:
 
-### Issue #88: Multi-Token Book Stipend Voucher
-- **Restricted Asset Drip**: Book tokens that can only be redeemed at verified bookstores
-- **Donor Control**: Donors create vouchers with specific educational purposes
-- **Spending Transparency**: Ensures educational credits are used as intended
-- **Expiry System**: Time-limited vouchers to encourage timely usage
+- **Course Streaming**: Pay-per-minute educational content streaming
+- **Scholarship System**: On-chain scholarship funding and management
+- **Student Profile NFTs**: Dynamic NFTs that grow with student achievements
+- **Governance**: Admin and global course veto mechanisms
+- **Gas Optimization**: Smart gas estimation and subsidy features
 
-### Issue #89: Zero-Knowledge GPA Verification Proof
-- **Privacy-Preserving Verification**: Students prove GPA > 3.5 without revealing exact grades
-- **ZK-Proof Integration**: Oracle uploads verification proofs instead of raw GPA data
-- **Financial Assurance**: Grantors receive confirmation of academic performance
-- **Academic Privacy**: Protects sensitive student information
+## Quick Start
 
-### Issue #90: Soulbound Scholarship Credential Minter
-- **On-Chain Diplomas**: Permanent, non-transferable credential NFTs
-- **Rich Metadata**: Includes total hours funded, major, and donor organization
-- **Social Capital**: Verifiable credentials for employers and other DAOs
-- **Graduation Triggers**: Automated credential minting upon program completion
+### Prerequisites
 
-### Issue #91: Inter-Protocol Reputation Sync
-- **Learning Velocity Score**: Cross-contract academic reputation metrics
-- **Ecosystem Synergy**: Stream-Scholar reputation benefits in Grant-Stream
-- **Junior Grant Prioritization**: High-scoring students get preferential treatment
-- **Learning-to-Earning Pipeline**: Academic achievement leads to professional opportunities
+- Rust 1.70+ (for Soroban contracts)
+- Node.js 16+ (for frontend and NFT features)
+- Docker and Docker Compose (for local testing)
+- Stellar account (testnet for development)
+
+### Local Test Network Setup
+
+To set up a local test network with Docker that pre-loads 5 dummy courses and 100 test USDC:
+
+1. Ensure Docker and Docker Compose are installed.
+
+2. Run the following command in the project root:
+   ```bash
+   docker compose up
+   ```
+
+3. The setup script will:
+   - Start a local Soroban network
+   - Generate and fund test accounts (admin, teacher, student)
+   - Deploy a USDC token contract and mint 100 USDC to the student account
+   - Deploy the scholar contract and initialize it
+   - Add 5 dummy courses to the registry
+
+4. The network will remain running. The contract IDs and account details will be displayed in the output.
+
+### Testing the Setup
+
+To verify the setup is successful:
+
+1. In a new terminal, exec into the running container:
+   ```bash
+   docker compose exec soroban-local bash
+   ```
+
+2. Check the list of courses:
+   ```bash
+   soroban contract invoke --id <SCHOLAR_CONTRACT_ID> --network standalone -- list_courses
+   ```
+   Expected output: `[1,2,3,4,5]`
+
+3. Check the USDC balance of the student:
+   ```bash
+   soroban contract invoke --id <USDC_TOKEN_ID> --network standalone -- balance --id <STUDENT_ADDRESS>
+   ```
+   Expected output: `1000000000` (100 USDC with 7 decimals)
+
+## Student Profile NFT Feature
+
+### Overview
+
+The Student Profile NFT system transforms a student's learning journey into a unique, tradable non-fungible token on the Stellar blockchain. Each NFT represents a student's profile that dynamically evolves based on their educational achievements.
+
+### Key Features
+
+- **Dynamic Leveling**: NFTs automatically level up (1-8) based on accumulated XP
+- **Achievement System**: Unlock badges and achievements that add visual flair to your NFT
+- **Course Tracking**: Link completed courses to earn XP and level up
+- **Study Streaks**: Maintain daily study habits for bonus rewards
+- **Visual Progression**: NFT artwork changes based on level and achievements
+- **Stellar Native**: Built on Stellar for low fees and fast transactions
+- **Transferable**: Own, trade, or gift your learning profile NFT
+
+### NFT Installation
+
+```bash
+# Install NFT dependencies
+npm install
+
+# Environment Setup
+cp .env.example .env
+# Edit .env with your Stellar credentials
+
+# Deploy NFT contract
+npm run deploy
+
+# Mint a student profile NFT
+npm run mint student123 "Alice Johnson" alice@example.com
+
+# Run frontend
+npm run dev
+```
+
+### Level System
+
+| Level | Name | Required XP | Visual Theme |
+|-------|------|-------------|--------------|
+| 1 | Beginner | 0 | Gray 🌱 |
+| 2 | Novice | 100 | Silver 📖 |
+| 3 | Apprentice | 250 | Bronze ⚒️ |
+| 4 | Scholar | 500 | Gold 🎓 |
+| 5 | Expert | 1,000 | Emerald 💎 |
+| 6 | Master | 2,000 | Blue 👑 |
+| 7 | Grandmaster | 5,000 | Purple 🔮 |
+| 8 | Legend | 10,000 | Orange 🏆 |
 
 ## Project Structure
 
 ```text
 .
-├── contracts
-│   └── scholar_contracts
-│       ├── src
-│       │   ├── lib.rs
-│       │   └── test.rs
-│       └── Cargo.toml
-├── Cargo.toml
-└── README.md
+├── contracts/
+│   ├── scholar_contracts/     # Main Soroban contracts
+│   └── token/                 # USDC token contract
+├── src/                       # NFT Student Profile system
+├── frontend/                  # NFT web interface
+├── scripts/                   # Deployment and management scripts
+├── docs/                      # Documentation
+├── tests/                     # Test files
+└── docker-compose.yml         # Local network setup
 ```
 
-## Key Data Structures
+## Core Features
 
-### BookStipendVoucher
-- `voucher_id`: Unique identifier
-- `donor`/`student`: Participants
-- `amount`: Book token quantity
-- `verified_bookstores`: Approved redemption locations
+### Course Streaming
+- Pay-per-minute streaming model
+- Session management and validation
+- Dynamic pricing based on demand
+- Teacher revenue sharing
 
-### ZKGPAProof
-- `proof_hash`: Cryptographic proof
-- `verification_level`: Minimum GPA threshold (35 = 3.5)
-- `verified_at`: Proof submission timestamp
+### Scholarship System
+- On-chain scholarship funding
+- Teacher-restricted withdrawals
+- Scholarship role management
+- Transparent fund allocation
 
-### SoulboundCredential
-- `credential_id`: Unique identifier
-- `total_hours_funded`: Educational investment
-- `major`/`donor_organization`: Academic context
+### Governance
+- Admin course veto and revocation
+- Global course veto mechanism
+- Platform governance features
+- Community-driven decisions
 
-### LearningVelocityScore
-- `score`: Calculated reputation metric
-- `courses_completed`/`avg_completion_time`: Performance data
+### Gas Optimization
+- Gas estimation service
+- Subsidy mechanisms for students
+- Optimized contract interactions
+- Cost-effective streaming
 
-## Testing
+## Development
 
-Run the comprehensive test suite:
+### Building Contracts
 
 ```bash
+# Build Soroban contracts
+cd contracts/scholar_contracts
+cargo build --target wasm32-unknown-unknown --release
+
+# Run tests
 cargo test
 ```
 
-Tests include:
-- Core scholarship functionality
-- Book stipend voucher flows
-- ZK GPA verification
-- Soulbound credential minting
-- Cross-contract reputation queries
+### Frontend Development
 
-## Deployed Contract
-- **Network:** Stellar Testnet
-- **Contract ID:** CB7OZPTIUENDWJWNHRGDPZLIEIS6TXMFRYT4WCGHIZVYLCTXEONC6VHY
+```bash
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+
+# Build for production
+npm run build
+```
+
+### Testing
+
+```bash
+# Run contract tests
+cargo test
+
+# Run NFT tests
+npm test
+
+# Run integration tests
+npm run test:integration
+```
+
+## Documentation
+
+- [Instructor Onboarding Guide](docs/INSTRUCTOR_ONBOARDING_GUIDE.md)
+- [WASM Size Benchmarking](docs/WASM_SIZE_BENCHMARKING.md)
+- [Course Metadata Implementation](docs/course-metadata-implementation-guide.md)
+- [Contribution Guidelines](CONTRIBUTING.md)
+
+## Security Features
+
+### Session Management
+The platform implements advanced session management to prevent unauthorized access:
+
+It natively extends the existing `heartbeat` function to validate a unique 32-byte `session_hash` (passed via the previously unused `_signature` parameter), ensuring complete backward compatibility with zero breaking changes to the API.
+
+**How it works:**
+* **Accepted Session:** When a heartbeat is received, it checks the stored session hash. If the hash matches the active session, or if the previous session has safely timed out (exceeding the `heartbeat_interval`), the stream is securely permitted.
+* **Rejected Session:** If the incoming hash does not match the stored hash *and* the previous session is currently active, the contract explicitly rejects the heartbeat. This immediately halts unauthorized parallel streams or duplicate logins.
+
+### Access Control
+- Role-based permissions
+- Teacher authentication
+- Student withdrawal protections
+- Admin governance controls
+
+## Network Deployment
+
+### Testnet Deployment
+
+```bash
+# Deploy to testnet
+./scripts/deploy.sh testnet
+
+# Verify deployment
+soroban contract info --id <CONTRACT_ID> --network testnet
+```
+
+### Mainnet Deployment
+
+```bash
+# Deploy to mainnet
+./scripts/deploy.sh mainnet
+
+# Note: Ensure sufficient gas fees and proper configuration
+```
+
+## Analytics & Monitoring
+
+- WASM size benchmarking
+- Gas usage optimization
+- Performance metrics
+- User engagement tracking
+
+## Contributing
+
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+
+## Roadmap
+
+### Phase 1 - Core Features 
+- [x] Course streaming platform
+- [x] Scholarship system
+- [x] Governance mechanisms
+- [x] Gas optimization
+- [x] Student Profile NFTs
+
+### Phase 2 - Enhanced Features (In Progress)
+- [ ] Social features (following, leaderboards)
+- [ ] Course marketplace integration
+- [ ] Advanced analytics dashboard
+- [ ] Mobile app development
+
+### Phase 3 - Ecosystem (Future)
+- [ ] DAO governance for achievement standards
+- [ ] Cross-chain compatibility
+- [ ] Institutional partnerships
+- [ ] Scholarship programs
+
+---
+
+**Built with ❤️ by the Stream-Scholar Team**
+
+*Transforming education into verifiable digital achievements on the Stellar blockchain.*

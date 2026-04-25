@@ -532,48 +532,15 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "SecurityCouncil"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
+                            "symbol": "Session"
+                          },
                           {
-                            "symbol": "Sep12Oracle"
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                           }
                         ]
                       },
                       "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
-                            "symbol": "SettlingPeriod"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "u64": "3"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
-                            "symbol": "TrackedTVL"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "i128": "72100"
+                        "bytes": "746573745f7369676e6174757265"
                       }
                     }
                   ]
