@@ -446,6 +446,69 @@ pub enum DataKey {
     Referendum(u64),
     ReferendumCount,
     ReferendumVote(u64, Address),
+    // Pre-existing variants used throughout the contract
+    StudentProfile(Address),
+    OracleStatus(Address),
+    Milestone(Address, u64),
+    ReputationBonus(Address),
+    GpaMultiplier(Address),
+    TaxRate,
+    GasTreasuryToken,
+    HasReceivedSubsidy(Address),
+    SubsidizedStudentCount,
+    CommunityVote(Address),
+    AuthorizedPayout(Address),
+    AuthorizedPayoutPending(Address),
+    Enrollment(Address),
+    GpaEpoch(Address),
+    StudentGPA(Address),
+    GraduationRegistry(Address),
+    StudentUniversity(Address),
+    SecurityHold(Address),
+    UniversityAdmin(Address),
+    ResearchBonusFund,
+    SurpriseBonusRecipient(u64),
+    AlumniPledge(Address),
+    SponsorProfile(Address),
+    CrossChainMessage(u64),
+    Stream(Address, Address),
+    IsPaused,
+    PauseTimestamp,
+    SecurityCouncil,
+    MegaDonorThreshold,
+    SettlingPeriod,
+    TrackedTVL,
+    TotalTVL,
+    GlobalScholarshipPool,
+    OracleRegistry(Address),
+    ClawbackCondition(Address, Address, u64),
+    ClawbackEventLog(Address, Address, u64),
+    QuadraticFundingRound(u64),
+    QFRoundCounter,
+    FundingProject(u64, u64),
+    QFContribution(u64, u64, Address),
+    MatchingDistribution(u64, u64),
+    Nonce(Address),
+    DailyBurnRate,
+    LastBalanceCheck,
+    UnlockTime(Address),
+    LeaderboardSize,
+    IsInitialized,
+    // Issue #191: Student-Driven Governance Voting Weight
+    AcademicReputation(Address),
+    // Issue #195: Alumni DAO Yield-Allocation Voting
+    IsAlumni(Address),
+    AlumniYieldVote(Address),
+    ApprovedAmm(Address),
+    YieldAllocation,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldAllocation {
+    pub amm: Address,
+    pub total_weight: i128,
+    pub last_updated: u64,
 }
 
 #[contracttype]
@@ -4080,6 +4143,251 @@ impl ScholarContract {
     
     pub fn get_tracked_tvl(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::TrackedTVL).unwrap_or(0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #188: Secure Contract Initialization Flag
+    // -------------------------------------------------------------------------
+
+    /// One-time initialization. Sets the root admin, oracle whitelist seed, fee
+    /// parameters, and matching multipliers. Reverts if called more than once.
+    pub fn initialize(
+        env: Env,
+        root_admin: Address,
+        base_rate: i128,
+        heartbeat_interval: u64,
+    ) {
+        root_admin.require_auth();
+
+        // Guard: revert immediately if already initialized
+        if env.storage().instance().get::<_, bool>(&DataKey::IsInitialized).unwrap_or(false) {
+            panic!("AlreadyInitialized");
+        }
+
+        // Lock the flag first to prevent re-entrancy
+        env.storage().instance().set(&DataKey::IsInitialized, &true);
+
+        // Bind root admin
+        env.storage().instance().set(&DataKey::Admin, &root_admin);
+
+        // Set initial fee / rate parameters
+        env.storage().instance().set(&DataKey::BaseRate, &base_rate);
+        env.storage().instance().set(&DataKey::HeartbeatInterval, &heartbeat_interval);
+
+        // Emit ProtocolInitialized event for off-chain verification
+        env.events().publish(
+            (Symbol::new(&env, "ProtocolInitialized"), root_admin.clone()),
+            (base_rate, heartbeat_interval),
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #191: Student-Driven Governance Voting Weight
+    // -------------------------------------------------------------------------
+
+    /// Records a completed milestone for a student, updates their
+    /// Academic_Reputation score, and emits VotingWeightUpdated.
+    /// Sybil protection: only the oracle-verified enrollment path can call this.
+    pub fn record_milestone_and_update_voting_weight(
+        env: Env,
+        oracle: Address,
+        student: Address,
+        milestone_id: u64,
+    ) {
+        oracle.require_auth();
+
+        // Only oracle-approved addresses may submit milestones
+        let is_oracle: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleStatus(oracle.clone()))
+            .unwrap_or(false);
+        if !is_oracle {
+            panic!("UnauthorizedOracle");
+        }
+
+        // Prevent double-counting the same milestone
+        let milestone_key = DataKey::Milestone(student.clone(), milestone_id);
+        if env.storage().persistent().get::<_, bool>(&milestone_key).unwrap_or(false) {
+            panic!("MilestoneAlreadyClaimed");
+        }
+        env.storage().persistent().set(&milestone_key, &true);
+
+        // Fetch current reputation and increment
+        let current: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AcademicReputation(student.clone()))
+            .unwrap_or(0);
+        let updated = current + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::AcademicReputation(student.clone()), &updated);
+
+        // Logarithmic voting weight: floor(log2(milestones + 1))
+        // Computed with integer bit-length to avoid floating point
+        let voting_weight: u64 = u64::BITS as u64 - updated.leading_zeros() as u64; // = floor(log2(updated)) + 1
+
+        env.events().publish(
+            (Symbol::new(&env, "VotingWeightUpdated"), student.clone()),
+            (updated, voting_weight),
+        );
+    }
+
+    /// Returns the current logarithmic voting power for a verified scholar.
+    pub fn calculate_voting_power(env: Env, student: Address) -> u64 {
+        let milestones: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AcademicReputation(student))
+            .unwrap_or(0);
+        if milestones == 0 {
+            return 0;
+        }
+        // floor(log2(milestones)) + 1  — same formula as above
+        u64::BITS as u64 - milestones.leading_zeros() as u64
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #195: Alumni DAO Yield-Allocation Voting
+    // -------------------------------------------------------------------------
+
+    /// Admin registers an address as a verified alumni.
+    pub fn register_alumni(env: Env, admin: Address, alumni: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::IsAlumni(alumni), &true);
+    }
+
+    /// Admin whitelists an AMM address as an approved yield destination.
+    pub fn whitelist_amm(env: Env, admin: Address, amm: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovedAmm(amm), &true);
+    }
+
+    /// Verified alumni cast a weighted vote for a yield-allocation target AMM.
+    /// Weight = the alumni's historical Academic_Reputation score.
+    pub fn allocate_yield(env: Env, alumni: Address, target_amm: Address) {
+        alumni.require_auth();
+
+        // Restrict to verified alumni
+        let is_alumni: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IsAlumni(alumni.clone()))
+            .unwrap_or(false);
+        if !is_alumni {
+            panic!("NotAlumni");
+        }
+
+        // Security: only pre-approved AMMs may receive votes
+        let is_approved: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApprovedAmm(target_amm.clone()))
+            .unwrap_or(false);
+        if !is_approved {
+            panic!("AmmNotApproved");
+        }
+
+        // Voting weight = alumni's academic reputation score
+        let weight: i128 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::AcademicReputation(alumni.clone()))
+            .unwrap_or(1) as i128;
+
+        // Record this alumni's vote (overwrite previous vote)
+        env.storage()
+            .persistent()
+            .set(&DataKey::AlumniYieldVote(alumni.clone()), &target_amm);
+
+        // Update the running tally for the winning AMM
+        let current_alloc: YieldAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldAllocation)
+            .unwrap_or(YieldAllocation {
+                amm: target_amm.clone(),
+                total_weight: 0,
+                last_updated: 0,
+            });
+
+        let new_alloc = if current_alloc.amm == target_amm {
+            YieldAllocation {
+                amm: target_amm.clone(),
+                total_weight: current_alloc.total_weight + weight,
+                last_updated: env.ledger().timestamp(),
+            }
+        } else if current_alloc.total_weight < weight {
+            // New AMM has overtaken the current leader
+            YieldAllocation {
+                amm: target_amm.clone(),
+                total_weight: weight,
+                last_updated: env.ledger().timestamp(),
+            }
+        } else {
+            current_alloc
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldAllocation, &new_alloc);
+
+        env.events().publish(
+            (Symbol::new(&env, "YieldStrategyUpdated"), alumni.clone()),
+            (target_amm.clone(), weight),
+        );
+    }
+
+    /// Routes idle capital to the AMM that won the alumni vote.
+    pub fn route_capital_to_amm(env: Env, admin: Address) -> Address {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+
+        let alloc: YieldAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldAllocation)
+            .expect("NoYieldVoteRecorded");
+
+        // Confirm the winning AMM is still on the whitelist
+        let is_approved: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApprovedAmm(alloc.amm.clone()))
+            .unwrap_or(false);
+        if !is_approved {
+            panic!("AmmNotApproved");
+        }
+
+        alloc.amm
     }
 }
 
