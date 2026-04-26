@@ -442,6 +442,10 @@ pub enum DataKey {
     OracleMultiSigThreshold,
     SlashedStudent(Address, u64), // student, course_id -> SlashedStudent
     DisciplinaryRecord(Address, u64), // student, course_id -> DisciplinaryPayload
+    DustSweeper,
+    Referendum(u64),
+    ReferendumCount,
+    ReferendumVote(u64, Address),
 }
 
 #[contracttype]
@@ -450,6 +454,22 @@ pub struct SubscriptionTier {
     pub subscriber: Address,
     pub expiry_time: u64,
     pub course_ids: Vec<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Referendum {
+    pub id: u64,
+    pub proposer: Address,
+    pub target_contract: Address,
+    pub function: Symbol,
+    pub args: Vec<soroban_sdk::Val>,
+    pub end_time: u64,
+    pub yes_votes: i128,
+    pub no_votes: i128,
+    pub executed: bool,
+    pub bond_amount: i128,
+    pub token: Address,
 }
 
 #[contracttype]
@@ -3184,7 +3204,19 @@ impl ScholarContract {
 
     fn check_and_apply_alumni_tax(env: &Env, alumni: &Address, amount: i128) -> i128 {
         if let Some(percentage) = env.storage().persistent().get::<_, u32>(&DataKey::AlumniPledge(alumni.clone())) {
-            let tax_amount = (amount * percentage as i128) / 100;
+            let raw_tax = amount * percentage as i128;
+            let mut tax_amount = raw_tax / 100;
+            let dust = raw_tax % 100;
+
+            let mut current_dust: i128 = env.storage().instance().get(&DataKey::DustSweeper).unwrap_or(0);
+            current_dust += dust;
+
+            if current_dust >= 100 {
+                tax_amount += current_dust / 100;
+                current_dust %= 100;
+            }
+            env.storage().instance().set(&DataKey::DustSweeper, &current_dust);
+            
             if tax_amount > 0 {
                 // Route to Global Scholarship Pool
                 let pool_address: Address = env.storage().instance().get(&DataKey::GlobalScholarshipPool)
@@ -3328,7 +3360,7 @@ impl ScholarContract {
         let mut stream: Stream = env.storage().persistent().get(&stream_key).expect("Stream not found");
         
         let current_time = env.ledger().timestamp();
-        let elapsed = current_time - stream.start_time;
+        let elapsed = current_time.saturating_sub(stream.start_time);
         let accrued = (elapsed as i128) * stream.amount_per_second;
         let available = accrued - stream.total_withdrawn;
         
@@ -3926,7 +3958,7 @@ impl ScholarContract {
         let last_check: u64 = env.storage().instance().get(&DataKey::LastBalanceCheck).unwrap_or(0);
         
         // Check for clawbacks every 100 ledgers (approximately every 100 seconds)
-        if current_time - last_check > 100 {
+        if current_time.saturating_sub(last_check) > 100 {
             let tracked_tvl: i128 = env.storage().instance().get(&DataKey::TrackedTVL).unwrap_or(0);
             let token_client = token::Client::new(&env, &token);
             let actual_balance = token_client.balance(&env.current_contract_address());
@@ -3968,6 +4000,67 @@ impl ScholarContract {
         // 2. Calculate new flow rates based on the ratio
         // 3. Update each stream's flow rate
         // 4. Flag terminated streams if necessary
+    }
+
+    // --- Issue #199: On-Chain Referendum Proposals ---
+    pub fn create_referendum(
+        env: Env, 
+        proposer: Address, 
+        target_contract: Address, 
+        function: Symbol, 
+        args: Vec<soroban_sdk::Val>, 
+        token: Address, 
+        bond_amount: i128
+    ) -> u64 {
+        proposer.require_auth();
+        
+        let safe_funcs = Vec::from_array(&env, [Symbol::new(&env, "set_tax_rate"), Symbol::new(&env, "set_base_rate"), Symbol::new(&env, "set_admin")]);
+        if !safe_funcs.contains(&function) {
+            panic!("Function not in safe whitelist");
+        }
+        
+        let client = token::Client::new(&env, &token);
+        client.transfer(&proposer, &env.current_contract_address(), &bond_amount);
+        
+        let count: u64 = env.storage().instance().get(&DataKey::ReferendumCount).unwrap_or(0);
+        let ref_id = count + 1;
+        let end_time = env.ledger().timestamp() + 604800; // 7 days voting period
+        
+        let referendum = Referendum { id: ref_id, proposer, target_contract, function, args, end_time, yes_votes: 0, no_votes: 0, executed: false, bond_amount, token };
+        env.storage().instance().set(&DataKey::ReferendumCount, &ref_id);
+        env.storage().persistent().set(&DataKey::Referendum(ref_id), &referendum);
+        ref_id
+    }
+
+    pub fn vote_referendum(env: Env, voter: Address, ref_id: u64, vote_yes: bool, voting_power: i128) {
+        voter.require_auth(); 
+        let mut referendum: Referendum = env.storage().persistent().get(&DataKey::Referendum(ref_id)).expect("Referendum not found");
+        if env.ledger().timestamp() >= referendum.end_time { panic!("Voting period has ended"); }
+        let vote_key = DataKey::ReferendumVote(ref_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) { panic!("Already voted"); }
+        env.storage().persistent().set(&vote_key, &true);
+        if vote_yes { referendum.yes_votes += voting_power; } else { referendum.no_votes += voting_power; }
+        env.storage().persistent().set(&DataKey::Referendum(ref_id), &referendum);
+    }
+
+    pub fn execute_referendum(env: Env, caller: Address, ref_id: u64) {
+        caller.require_auth();
+        let mut referendum: Referendum = env.storage().persistent().get(&DataKey::Referendum(ref_id)).expect("Referendum not found");
+        if env.ledger().timestamp() < referendum.end_time { panic!("Voting period active"); }
+        if referendum.executed { panic!("Already executed"); }
+        
+        referendum.executed = true;
+        env.storage().persistent().set(&DataKey::Referendum(ref_id), &referendum);
+        
+        let client = token::Client::new(&env, &referendum.token);
+        client.transfer(&env.current_contract_address(), &referendum.proposer, &referendum.bond_amount);
+        
+        if referendum.yes_votes > referendum.no_votes {
+            env.invoke_contract::<soroban_sdk::Val>(&referendum.target_contract, &referendum.function, referendum.args.clone());
+            env.events().publish((Symbol::new(&env, "ReferendumExecuted"), ref_id), true);
+        } else {
+            env.events().publish((Symbol::new(&env, "ReferendumExecuted"), ref_id), false);
+        }
     }
     
     // Utility functions for testing and configuration
