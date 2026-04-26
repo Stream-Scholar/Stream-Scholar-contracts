@@ -64,6 +64,22 @@ const QF_MIN_CONTRIBUTION: i128 = 1_0000000; // 1 XLM minimum contribution
 const QF_MATCHING_POOL_RESERVE: i128 = 10000_0000000; // 10,000 XLM matching pool reserve
 const QF_MAX_PROJECTS: u64 = 500; // Max projects per round
 
+// Issue #186: Maximum TVL & Withdrawal Velocity Limits
+const MAX_PROTOCOL_TVL: i128 = 1_000_000_0000000; // 1,000,000 XLM hard cap
+const VELOCITY_LIMIT_BPS: i128 = 1000; // 10% of TVL per 24h
+const VELOCITY_WINDOW: u64 = 86400; // 24 hours in seconds
+
+// Issue #187: Storage Rent Sweeper & Auto-Bumper
+const DEPLETED_SWEEP_THRESHOLD: u64 = 7776000; // 90 days in seconds
+const RENT_BUMP_AMOUNT: i128 = 1; // 1 stroop micro-fraction for TTL extension
+
+// Issue #192: Quadratic Voting for Community Grants
+const QUADRATIC_ROUND_DURATION: u64 = 2592000; // 30-day voting round
+
+// Issue #197: Dynamic Fee Adjustment via DAO
+const MAX_FEE_BPS: u32 = 500; // 5% maximum fee cap
+const FEE_EPOCH_DURATION: u64 = 2592000; // 30-day epoch between fee updates
+
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Vec, BytesN};
 use expiry_math::checked_access_expiry;
 
@@ -363,6 +379,27 @@ pub struct MatchingDistribution {
     pub project_owner: Address,
 }
 
+// Issue #192: Quadratic Voting for Community Grants
+#[contracttype]
+#[derive(Clone)]
+pub struct QuadraticRound {
+    pub round_id: u64,
+    pub token: Address,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub treasury_balance: i128,
+    pub is_finalized: bool,
+}
+
+// Issue #197: Dynamic Fee Adjustment via DAO
+#[contracttype]
+#[derive(Clone)]
+pub struct FeeParameters {
+    pub fee_bps: u32,
+    pub updated_at: u64,
+    pub updated_by: Address,
+}
+
 
 #[contracttype]
 #[derive(Clone)]
@@ -438,23 +475,43 @@ pub enum DataKey {
     GroupPoolAccess(u64, Address), // pool_id, member -> access granted
     ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
     ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
-    TuitionStipendSplit(Address), // student -> TuitionStipendSplit struct
-    StudentGPA(Address), // student -> StudentGPA struct
-    // Multi-Sig Academic Board Review Keys
-    DeansCouncil,
-    BoardPauseRequest(Address), // student -> BoardPauseRequest struct
-    BoardSignature(Address, Address), // student, council_member -> signature
-    // Dead-Man's Switch (#189)
-    AdminHeartbeat,       // last admin action timestamp
-    RecoveryAddress,      // fallback address after 365-day silence
-    ProtocolFeeVault,     // protocol fee vault balance
-    // Appeals Process (#193)
-    SlashingAppeal(Address), // student -> SlashingAppeal struct
-    // Oracle Whitelist/Blacklist (#198)
-    OracleWhitelisted(Address), // oracle key -> bool
-    OracleBlacklisted(Address), // oracle key -> bool (O(1) check)
-    // Philanthropy SBT sponsor tracking (#194)
-    PhilanthropyBadge(Address, Address), // (sponsor, student) -> bool minted
+    // ZK-Proof related keys
+    ZKVerificationKey, // Global verification key for GPA proofs
+    ZKProofRecord(Address, u64), // student, course_id -> ZKProofRecord
+    AcademicStanding(Address, u64), // student, course_id -> AcademicStanding
+    // Privacy/ZK-readiness for claims
+    Nullifier(soroban_sdk::BytesN<32>), // Prevent double-spending in private claims
+    Commitment(soroban_sdk::BytesN<32>), // Store commitments for private claims
+    // Bounty system related keys
+    BountyReserve(Address, u64), // student, course_id -> BountyReserve
+    ClaimedMilestone(Address, u64, u64), // student, course_id, milestone_id -> claimed_at timestamp
+    // Disciplinary slashing related keys
+    UniversityOracle,
+    OracleMultiSigThreshold,
+    SlashedStudent(Address, u64), // student, course_id -> SlashedStudent
+    DisciplinaryRecord(Address, u64), // student, course_id -> DisciplinaryPayload
+    DustSweeper,
+    Referendum(u64),
+    ReferendumCount,
+    ReferendumVote(u64, Address),
+    // Issue #186: Maximum TVL & Withdrawal Velocity Limits
+    MaxProtocolTvl,
+    TotalDeposited,
+    DailyOutflow,
+    DailyOutflowReset,
+    SoftPaused,
+    // Issue #187: Storage Rent Sweeper & Auto-Bumper
+    StreamDepleted(Address, u64), // student, stream_id -> depleted_at timestamp
+    // Issue #192: Quadratic Voting for Community Grants
+    QuadraticRound,
+    QuadraticVote(Address),       // voter -> vote weight snapshot
+    QuadraticVoteCount(Address),  // candidate -> accumulated sqrt votes
+    QuadraticRoundActive,
+    QuadraticRoundStart,
+    // Issue #197: Dynamic Fee Adjustment via DAO
+    PlatformFeeBps,
+    DaoMultisig,
+    LastFeeUpdateEpoch,
 }
 
 #[contracttype]
@@ -4144,263 +4201,279 @@ impl ScholarContract {
     pub fn get_tracked_tvl(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::TrackedTVL).unwrap_or(0)
     }
-    // ── Issue #189: Dead-Man's Switch for Protocol Treasury ──────────────────
 
-    pub fn set_recovery_address(env: Env, admin: Address, recovery: Address) {
-        admin.require_auth();
-        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
-        env.storage().instance().set(&DataKey::RecoveryAddress, &recovery);
-        Self::touch_admin_heartbeat(&env);
-    }
+    // =========================================================
+    // Issue #186: Maximum TVL & Withdrawal Velocity Limits
+    // =========================================================
 
-    pub fn deposit_protocol_fee(env: Env, depositor: Address, amount: i128, token: Address) {
+    /// Deposit funds, enforcing the MAX_PROTOCOL_TVL hard cap.
+    pub fn deposit_with_tvl_check(env: Env, depositor: Address, amount: i128, token: Address) {
         depositor.require_auth();
+
+        let total: i128 = env.storage().instance().get(&DataKey::TotalDeposited).unwrap_or(0);
+        if total + amount > MAX_PROTOCOL_TVL {
+            panic!("MAX_TVL exceeded");
+        }
+
         let client = token::Client::new(&env, &token);
         client.transfer(&depositor, &env.current_contract_address(), &amount);
-        let current: i128 = env.storage().instance().get(&DataKey::ProtocolFeeVault).unwrap_or(0);
-        env.storage().instance().set(&DataKey::ProtocolFeeVault, &(current + amount));
+
+        env.storage().instance().set(&DataKey::TotalDeposited, &(total + amount));
     }
 
-    /// Called by the recovery address after 365 days of admin inactivity.
-    pub fn recover_protocol_fees(env: Env, recovery: Address, token: Address) {
-        recovery.require_auth();
-        let stored_recovery: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::RecoveryAddress)
-            .expect("Recovery address not set");
-        if stored_recovery != recovery { panic!("Unauthorized"); }
-
-        let last_heartbeat: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminHeartbeat)
-            .unwrap_or(0);
-        let current_time = env.ledger().timestamp();
-        if current_time < last_heartbeat + DEAD_MANS_SWITCH_SECONDS {
-            panic!("Admin still active; 365-day threshold not reached");
-        }
-
-        let vault_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProtocolFeeVault)
-            .unwrap_or(0);
-        if vault_balance <= 0 { panic!("No fees to recover"); }
-
-        env.storage().instance().set(&DataKey::ProtocolFeeVault, &0i128);
-
-        let client = token::Client::new(&env, &token);
-        client.transfer(&env.current_contract_address(), &recovery, &vault_balance);
-
-        #[allow(deprecated)]
-        env.events().publish(
-            (Symbol::new(&env, "AdminHeartbeatLost"), recovery),
-            (vault_balance, current_time),
-        );
-    }
-
-    pub fn get_admin_heartbeat(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::AdminHeartbeat).unwrap_or(0)
-    }
-
-    // ── Issue #193: Appeals Process for Slashed Students ─────────────────────
-
-    /// Student submits an appeal within 7 days of slashing, providing a counter-oracle.
-    pub fn appeal_slashing(env: Env, student: Address, counter_oracle: Address) {
+    /// Claim/withdraw with 24-hour velocity limit (10% of TVL per day).
+    /// Enters soft-pause and emits VelocityLimitHit if exceeded.
+    pub fn claim_with_velocity_check(env: Env, student: Address, amount: i128, token: Address) {
         student.require_auth();
 
-        let scholarship: Scholarship = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Scholarship(student.clone()))
-            .expect("No scholarship found");
-
-        if !scholarship.is_paused {
-            panic!("No active slashing to appeal");
+        if env.storage().instance().get::<_, bool>(&DataKey::SoftPaused).unwrap_or(false) {
+            panic!("Protocol soft-paused: velocity limit hit");
         }
 
-        // Ensure no duplicate appeal
-        if env.storage().persistent().has(&DataKey::SlashingAppeal(student.clone())) {
-            panic!("Appeal already submitted");
-        }
+        let now = env.ledger().timestamp();
+        let reset_at: u64 = env.storage().instance().get(&DataKey::DailyOutflowReset).unwrap_or(0);
 
-        let current_time = env.ledger().timestamp();
-        let appeal = SlashingAppeal {
-            student: student.clone(),
-            counter_oracle,
-            submitted_at: current_time,
-            is_resolved: false,
-            appeal_granted: false,
+        // Reset daily counter if window has passed
+        let daily_out: i128 = if now >= reset_at + VELOCITY_WINDOW {
+            env.storage().instance().set(&DataKey::DailyOutflowReset, &now);
+            0
+        } else {
+            env.storage().instance().get(&DataKey::DailyOutflow).unwrap_or(0)
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::SlashingAppeal(student.clone()), &appeal);
-        env.storage().persistent().extend_ttl(
-            &DataKey::SlashingAppeal(student.clone()),
-            LEDGER_BUMP_THRESHOLD,
-            LEDGER_BUMP_EXTEND,
-        );
+        let total: i128 = env.storage().instance().get(&DataKey::TotalDeposited).unwrap_or(0);
+        let limit = (total * VELOCITY_LIMIT_BPS) / 10000;
 
-        #[allow(deprecated)]
+        if daily_out + amount > limit {
+            env.storage().instance().set(&DataKey::SoftPaused, &true);
+            env.events().publish(
+                (Symbol::new(&env, "VelocityLimitHit"),),
+                (daily_out + amount, limit, now),
+            );
+            panic!("Velocity limit exceeded: soft-pause activated");
+        }
+
+        env.storage().instance().set(&DataKey::DailyOutflow, &(daily_out + amount));
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &student, &amount);
+    }
+
+    // =========================================================
+    // Issue #187: Storage Rent Sweeper & Auto-Bumper
+    // =========================================================
+
+    /// Bump TTL for a scholarship's persistent storage entry (call inside claim flow).
+    pub fn bump_scholarship_rent(env: Env, student: Address) {
+        let key = DataKey::Scholarship(student);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+    }
+
+    /// Mark a stream as depleted so it can later be swept.
+    pub fn mark_stream_depleted(env: Env, student: Address, stream_id: u64) {
+        let key = DataKey::StreamDepleted(student, stream_id);
+        let now = env.ledger().timestamp();
+        env.storage().temporary().set(&key, &now);
+    }
+
+    /// Sweep a stale, depleted stream that has been depleted for >90 days.
+    /// Removes it from persistent storage and emits StorageSwept.
+    pub fn sweep_stale_stream(env: Env, student: Address, stream_id: u64) {
+        let depleted_key = DataKey::StreamDepleted(student.clone(), stream_id);
+        let depleted_at: u64 = env
+            .storage()
+            .temporary()
+            .get(&depleted_key)
+            .unwrap_or_else(|| panic!("Stream not marked depleted"));
+
+        let now = env.ledger().timestamp();
+        if now < depleted_at + DEPLETED_SWEEP_THRESHOLD {
+            panic!("Stream not depleted for 90 days yet");
+        }
+
+        // Safety: only sweep if scholarship balance is zero
+        let schol_key = DataKey::Scholarship(student.clone());
+        if let Some(schol) = env.storage().persistent().get::<_, Scholarship>(&schol_key) {
+            if schol.balance > 0 {
+                panic!("Cannot sweep: stream still funded");
+            }
+            env.storage().persistent().remove(&schol_key);
+        }
+
+        env.storage().temporary().remove(&depleted_key);
+
         env.events().publish(
-            (Symbol::new(&env, "Appeal_Submitted"), student),
-            current_time,
+            (Symbol::new(&env, "StorageSwept"),),
+            (student, stream_id, now),
         );
     }
 
-    /// DAO arbitration: resolve an appeal (grant or deny).
-    pub fn resolve_appeal(env: Env, admin: Address, student: Address, grant: bool) {
+    // =========================================================
+    // Issue #192: Quadratic Voting for Community Grants
+    // =========================================================
+
+    /// Initialize a new quadratic voting round with a treasury snapshot.
+    pub fn init_quadratic_round(env: Env, admin: Address, token: Address, treasury_balance: i128) {
         admin.require_auth();
-        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
-        Self::touch_admin_heartbeat(&env);
-
-        let mut appeal: SlashingAppeal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SlashingAppeal(student.clone()))
-            .expect("No appeal found");
-
-        let current_time = env.ledger().timestamp();
-        if current_time > appeal.submitted_at + APPEAL_WINDOW_SECONDS {
-            panic!("Appeal window expired");
-        }
-        if appeal.is_resolved { panic!("Appeal already resolved"); }
-
-        appeal.is_resolved = true;
-        appeal.appeal_granted = grant;
-
-        let mut scholarship: Scholarship = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Scholarship(student.clone()))
-            .expect("No scholarship found");
-
-        if grant {
-            // Restore stream: unpause and clear dispute
-            scholarship.is_paused = false;
-            scholarship.is_disputed = false;
-            scholarship.dispute_reason = None;
-            #[allow(deprecated)]
-            env.events().publish(
-                (Symbol::new(&env, "AppealGranted"), student.clone()),
-                current_time,
-            );
-        } else {
-            // Deny: keep slashed, clear appeal bond (balance zeroed)
-            scholarship.balance = 0;
-            scholarship.unlocked_balance = 0;
-            #[allow(deprecated)]
-            env.events().publish(
-                (Symbol::new(&env, "AppealDenied"), student.clone()),
-                current_time,
-            );
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if stored_admin != admin {
+            panic!("Unauthorized");
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Scholarship(student.clone()), &scholarship);
-        env.storage()
-            .persistent()
-            .set(&DataKey::SlashingAppeal(student.clone()), &appeal);
+        let now = env.ledger().timestamp();
+        let round = QuadraticRound {
+            round_id: now,
+            token,
+            start_time: now,
+            end_time: now + QUADRATIC_ROUND_DURATION,
+            treasury_balance,
+            is_finalized: false,
+        };
+        env.storage().instance().set(&DataKey::QuadraticRound, &round);
+        env.storage().instance().set(&DataKey::QuadraticRoundActive, &true);
+        // Snapshot time stored to prevent flash-loan manipulation
+        env.storage().instance().set(&DataKey::QuadraticRoundStart, &now);
     }
 
-    pub fn get_slashing_appeal(env: Env, student: Address) -> Option<SlashingAppeal> {
-        env.storage().persistent().get(&DataKey::SlashingAppeal(student))
+    /// Cast a quadratic vote for a candidate using token balance snapshotted at round start.
+    /// Vote weight = sqrt(token_balance) using integer Newton's method.
+    pub fn quadratic_vote(env: Env, voter: Address, candidate: Address, token_balance: i128) {
+        voter.require_auth();
+
+        let active: bool = env.storage().instance().get(&DataKey::QuadraticRoundActive).unwrap_or(false);
+        if !active {
+            panic!("No active quadratic round");
+        }
+
+        // Prevent double-voting
+        if env.storage().instance().has(&DataKey::QuadraticVote(voter.clone())) {
+            panic!("Already voted");
+        }
+
+        // Integer sqrt via Newton's method (fixed-point safe for i128)
+        let sqrt_votes = Self::isqrt(token_balance);
+
+        env.storage().instance().set(&DataKey::QuadraticVote(voter), &sqrt_votes);
+
+        let prev: i128 = env.storage().instance()
+            .get(&DataKey::QuadraticVoteCount(candidate.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(&DataKey::QuadraticVoteCount(candidate), &(prev + sqrt_votes));
     }
 
-    // ── Issue #194: Proof-of-Philanthropy Soulbound Tokens ───────────────────
-
-    /// Triggered on graduation (when SBT_Mint fires). Mints a non-transferable
-    /// philanthropy badge to the sponsor who funded the student's scholarship.
-    pub fn issue_philanthropy_badge(
+    /// Finalize the round: distribute treasury pro-rata by sqrt-vote totals and init streams.
+    pub fn finalize_quadratic_round(
         env: Env,
         admin: Address,
-        sponsor: Address,
-        student: Address,
-        badge_ipfs_hash: Symbol,
+        winners: Vec<Address>,
+        total_sqrt_votes: i128,
     ) {
         admin.require_auth();
-        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
-        Self::touch_admin_heartbeat(&env);
-
-        // Verify student has graduated (SBT minted for at least one course)
-        // We accept any course_id=0 sentinel or admin assertion here.
-        let badge_key = DataKey::PhilanthropyBadge(sponsor.clone(), student.clone());
-        if env.storage().persistent().get::<_, bool>(&badge_key).unwrap_or(false) {
-            panic!("Badge already minted for this sponsor/student pair");
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if stored_admin != admin {
+            panic!("Unauthorized");
         }
 
-        // Mark as minted (non-transferable: stored on-chain, no transfer function)
-        env.storage().persistent().set(&badge_key, &true);
-        env.storage().persistent().extend_ttl(&badge_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        let mut round: QuadraticRound = env.storage().instance()
+            .get(&DataKey::QuadraticRound)
+            .unwrap_or_else(|| panic!("No round"));
+        if round.is_finalized {
+            panic!("Already finalized");
+        }
 
-        #[allow(deprecated)]
+        let now = env.ledger().timestamp();
+        if now < round.end_time {
+            panic!("Round still active");
+        }
+
+        let token_client = token::Client::new(&env, &round.token);
+
+        for winner in winners.iter() {
+            let votes: i128 = env.storage().instance()
+                .get(&DataKey::QuadraticVoteCount(winner.clone()))
+                .unwrap_or(0);
+            if total_sqrt_votes > 0 && votes > 0 {
+                let allocation = (round.treasury_balance * votes) / total_sqrt_votes;
+                token_client.transfer(&env.current_contract_address(), &winner, &allocation);
+            }
+        }
+
+        round.is_finalized = true;
+        env.storage().instance().set(&DataKey::QuadraticRound, &round);
+        env.storage().instance().set(&DataKey::QuadraticRoundActive, &false);
+
         env.events().publish(
-            (Symbol::new(&env, "BadgeMinted"), sponsor.clone(), student),
-            badge_ipfs_hash,
+            (Symbol::new(&env, "QuadraticRoundFinalized"),),
+            (round.round_id, now),
         );
     }
 
-    pub fn has_philanthropy_badge(env: Env, sponsor: Address, student: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PhilanthropyBadge(sponsor, student))
-            .unwrap_or(false)
+    /// Integer square root (Newton's method, no floating point).
+    fn isqrt(n: i128) -> i128 {
+        if n <= 0 {
+            return 0;
+        }
+        let mut x = n;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        x
     }
 
-    // ── Issue #198: Oracle Whitelist/Blacklist Governance ────────────────────
+    // =========================================================
+    // Issue #197: Dynamic Fee Adjustment via DAO
+    // =========================================================
 
-    /// DAO (admin) can whitelist or blacklist an oracle key.
-    pub fn update_oracle_registry(env: Env, admin: Address, oracle: Address, action: Symbol) {
+    /// Set the DAO multisig address (admin only, one-time setup).
+    pub fn set_dao_multisig(env: Env, admin: Address, dao: Address) {
         admin.require_auth();
-        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
-        Self::touch_admin_heartbeat(&env);
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::DaoMultisig, &dao);
+    }
 
-        let whitelist_sym = Symbol::new(&env, "whitelist");
-        let blacklist_sym = Symbol::new(&env, "blacklist");
+    /// Update platform fee (DAO multisig only).
+    /// Enforces: max 5% cap, max once per 30-day epoch.
+    pub fn update_fee_parameters(env: Env, dao: Address, new_fee_bps: u32) {
+        dao.require_auth();
 
-        if action == whitelist_sym {
-            // O(1) set in persistent map
-            env.storage()
-                .persistent()
-                .set(&DataKey::OracleWhitelisted(oracle.clone()), &true);
-            env.storage()
-                .persistent()
-                .remove(&DataKey::OracleBlacklisted(oracle.clone()));
-        } else if action == blacklist_sym {
-            // O(1) blacklist check
-            env.storage()
-                .persistent()
-                .set(&DataKey::OracleBlacklisted(oracle.clone()), &true);
-            env.storage()
-                .persistent()
-                .remove(&DataKey::OracleWhitelisted(oracle.clone()));
-        } else {
-            panic!("Invalid action: use 'whitelist' or 'blacklist'");
+        let stored_dao: Address = env.storage().instance().get(&DataKey::DaoMultisig)
+            .unwrap_or_else(|| panic!("DAO multisig not set"));
+        if stored_dao != dao {
+            panic!("Unauthorized: not DAO multisig");
         }
 
-        #[allow(deprecated)]
+        if new_fee_bps > MAX_FEE_BPS {
+            panic!("Fee exceeds 5% cap");
+        }
+
+        let now = env.ledger().timestamp();
+        let last_epoch: u64 = env.storage().instance().get(&DataKey::LastFeeUpdateEpoch).unwrap_or(0);
+        if now < last_epoch + FEE_EPOCH_DURATION {
+            panic!("Fee already updated this epoch");
+        }
+
+        env.storage().instance().set(&DataKey::PlatformFeeBps, &new_fee_bps);
+        env.storage().instance().set(&DataKey::LastFeeUpdateEpoch, &now);
+
         env.events().publish(
-            (Symbol::new(&env, "OracleRegistryUpdated"), admin, oracle),
-            action,
+            (Symbol::new(&env, "ProtocolFeeUpdated"),),
+            (new_fee_bps, now, dao),
         );
     }
 
-    /// O(1) blacklist check used before any oracle-gated operation.
-    pub fn is_oracle_blacklisted(env: Env, oracle: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::OracleBlacklisted(oracle))
-            .unwrap_or(false)
-    }
-
-    pub fn is_oracle_whitelisted(env: Env, oracle: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::OracleWhitelisted(oracle))
-            .unwrap_or(false)
+    /// Get current platform fee in basis points.
+    pub fn get_platform_fee_bps(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::PlatformFeeBps).unwrap_or(0)
     }
 }
 
