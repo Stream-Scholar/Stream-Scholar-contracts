@@ -705,12 +705,12 @@ fn test_withdrawal_whitelisting() {
     client.set_authorized_payout_address(&student, &payout);
 
     // Try to confirm early (should fail)
-    let result = env.try_invoke_contract::<(), Error>(&contract_id, &Symbol::new(&env, "confirm_authorized_payout_address"), (student.clone(),).into_val(&env));
+    let result = env.try_invoke_contract::<(), Error>(&contract_id, &Symbol::new(&env, "confirm_payout_unlock"), (student.clone(),).into_val(&env));
     assert!(result.is_err());
 
     // Confirm after 48 hours (172800 seconds)
     env.ledger().set_timestamp(172801);
-    client.confirm_authorized_payout_address(&student);
+    client.confirm_payout_unlock(&student);
 
     // Claim scholarship
     client.claim_scholarship(&student, &200);
