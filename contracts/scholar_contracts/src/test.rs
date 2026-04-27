@@ -2304,6 +2304,8 @@ fn test_private_claim_logic() {
     );
     assert!(result_invalid.is_err());
 }
+    assert!(result_invalid.is_err());
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #209 — Final E2E Integration Test (Oracle to Yield)

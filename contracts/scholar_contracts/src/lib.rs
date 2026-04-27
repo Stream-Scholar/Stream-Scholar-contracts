@@ -101,6 +101,7 @@ const GPA_BONUS_THRESHOLD: u64 = 35; // 3.5 GPA threshold (stored as 35 to avoid
 const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // 2% per 0.1 GPA (20% per 1.0 GPA)
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal contract event variants.
 pub enum Event {
     SbtMint(Address, u64),
     CheckpointPassed(Address, u64, u64), // student, course_id, checkpoint_timestamp
@@ -114,6 +115,7 @@ pub enum Event {
 /// On-chain record of a student's time-based access to a single course.
 #[contracttype]
 #[derive(Clone)]
+/// On-chain record of a student's time-based access to a single course.
 pub struct Access {
     pub student: Address,
     pub course_id: u64,
@@ -126,6 +128,7 @@ pub struct Access {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Sponsor preference for idle-capital yield routing.
 pub enum SponsorYieldPreference {
     Reinvest,
     ReturnToSponsor,
@@ -134,6 +137,7 @@ pub enum SponsorYieldPreference {
 
 #[contracttype]
 #[derive(Clone)]
+/// Profile of a scholarship sponsor including yield preferences.
 pub struct SponsorProfile {
     pub preference: SponsorYieldPreference,
     pub total_sponsored: i128,
@@ -143,6 +147,7 @@ pub struct SponsorProfile {
 /// On-chain scholarship account for a student.
 #[contracttype]
 #[derive(Clone)]
+/// On-chain scholarship account for a student.
 pub struct Scholarship {
     pub funder: Address,
     pub balance: i128,
@@ -157,6 +162,7 @@ pub struct Scholarship {
 
 #[contracttype]
 #[derive(Clone)]
+/// Active streaming session state for a student on a course.
 pub struct Stream {
     pub funder: Address,
     pub student: Address,
@@ -170,6 +176,7 @@ pub struct Stream {
 
 #[contracttype]
 #[derive(Clone)]
+/// A single entry in the academic leaderboard.
 pub struct LeaderboardEntry {
     pub student_alias: Symbol,
     pub academic_points: u64,
@@ -179,6 +186,7 @@ pub struct LeaderboardEntry {
 
 #[contracttype]
 #[derive(Clone)]
+/// Global pool funded by top-performing student bonuses.
 pub struct GlobalExcellencePool {
     pub total_pool_balance: i128,
     pub token: Address,
@@ -190,6 +198,7 @@ pub struct GlobalExcellencePool {
 // Issue #94: Peer-to-Peer Tutoring Payment Bridge structs
 #[contracttype]
 #[derive(Clone)]
+/// Agreement between a student and a tutor for paid sessions.
 pub struct TutoringAgreement {
     pub scholar: Address,
     pub tutor: Address,
@@ -203,6 +212,7 @@ pub struct TutoringAgreement {
 
 #[contracttype]
 #[derive(Clone)]
+/// Configuration for redirecting a sub-stream to another address.
 pub struct SubStreamRedirect {
     pub from_scholar: Address,
     pub to_tutor: Address,
@@ -216,6 +226,7 @@ pub struct SubStreamRedirect {
 // Issue #95: Alumni Donation Matching Incentive structs
 #[contracttype]
 #[derive(Clone)]
+/// Soulbound token awarded upon course graduation.
 pub struct GraduationSBT {
     pub student: Address,
     pub graduation_date: u64,
@@ -226,6 +237,7 @@ pub struct GraduationSBT {
 
 #[contracttype]
 #[derive(Clone)]
+/// Record of an alumni donation to the scholarship pool.
 pub struct AlumniDonation {
     pub donor: Address,
     pub original_amount: i128,
@@ -237,6 +249,7 @@ pub struct AlumniDonation {
 
 #[contracttype]
 #[derive(Clone)]
+/// Fund pool for rewarding academic excellence.
 pub struct GeneralExcellenceFund {
     pub total_balance: i128,
     pub token: Address,
@@ -248,6 +261,7 @@ pub struct GeneralExcellenceFund {
 // Issue #106: Research Bonus Fund — treasury yield redirected to top-5% student bonuses
 #[contracttype]
 #[derive(Clone)]
+/// Escrow fund for research milestone bonuses.
 pub struct ResearchBonusFund {
     pub total_balance: i128,
     pub token: Address,
@@ -259,6 +273,7 @@ pub struct ResearchBonusFund {
 // Issue #93: Scholarship Probation Cooling-Off Logic structs
 #[contracttype]
 #[derive(Clone)]
+/// Academic probation status for a student.
 pub struct ProbationStatus {
     pub student: Address,
     pub is_on_probation: bool,
@@ -272,6 +287,7 @@ pub struct ProbationStatus {
 
 #[contracttype]
 #[derive(Clone)]
+/// Oracle-reported GPA update payload for a student.
 pub struct GPAUpdate {
     pub student: Address,
     pub new_gpa: u64,
@@ -283,6 +299,7 @@ pub struct GPAUpdate {
 // Dynamic Sponsor-Clawback Logic structs
 #[contracttype]
 #[derive(Clone)]
+/// Conditions that can trigger a scholarship clawback.
 pub enum ClawbackTriggerType {
     GpaThreshold,
     CourseCompletion,
@@ -293,6 +310,7 @@ pub enum ClawbackTriggerType {
 
 #[contracttype]
 #[derive(Clone)]
+/// Configuration for a scholarship clawback condition.
 pub struct ClawbackCondition {
     pub funder: Address,
     pub student: Address,
@@ -308,6 +326,7 @@ pub struct ClawbackCondition {
 
 #[contracttype]
 #[derive(Clone)]
+/// Record of an executed scholarship clawback.
 pub struct ClawbackEvent {
     pub funder: Address,
     pub student: Address,
@@ -320,6 +339,7 @@ pub struct ClawbackEvent {
 
 #[contracttype]
 #[derive(Clone)]
+/// Sponsor-defined policy governing clawback conditions.
 pub struct SponsorClawbackPolicy {
     pub sponsor: Address,
     pub version: u64,
@@ -332,6 +352,7 @@ pub struct SponsorClawbackPolicy {
 // Matching-Pool Quadratic Funding structs
 #[contracttype]
 #[derive(Clone)]
+/// A quadratic funding round for course or project grants.
 pub struct QuadraticFundingRound {
     pub round_id: u64,
     pub token: Address,
@@ -348,6 +369,7 @@ pub struct QuadraticFundingRound {
 
 #[contracttype]
 #[derive(Clone)]
+/// A project eligible for quadratic funding.
 pub struct FundingProject {
     pub project_id: u64,
     pub round_id: u64,
@@ -363,6 +385,7 @@ pub struct FundingProject {
 
 #[contracttype]
 #[derive(Clone)]
+/// A single contribution to a quadratic funding project.
 pub struct QFContribution {
     pub contributor: Address,
     pub project_id: u64,
@@ -373,6 +396,7 @@ pub struct QFContribution {
 
 #[contracttype]
 #[derive(Clone)]
+/// Calculated matching distribution for a QF round.
 pub struct MatchingDistribution {
     pub round_id: u64,
     pub project_id: u64,
@@ -384,6 +408,7 @@ pub struct MatchingDistribution {
 // Issue #192: Quadratic Voting for Community Grants
 #[contracttype]
 #[derive(Clone)]
+/// State of an active or completed quadratic funding round.
 pub struct QuadraticRound {
     pub round_id: u64,
     pub token: Address,
@@ -396,6 +421,7 @@ pub struct QuadraticRound {
 // Issue #197: Dynamic Fee Adjustment via DAO
 #[contracttype]
 #[derive(Clone)]
+/// Platform fee configuration parameters.
 pub struct FeeParameters {
     pub fee_bps: u32,
     pub updated_at: u64,
@@ -405,6 +431,7 @@ pub struct FeeParameters {
 
 #[contracttype]
 #[derive(Clone)]
+/// Reserve pool for bounty payouts.
 pub struct BountyReserve {
     pub balance: i128,
     pub token: Address,
@@ -412,6 +439,7 @@ pub struct BountyReserve {
 }
 
 #[contracttype]
+/// Categories of academic or platform violations.
 pub enum ViolationType {
     Minor = 1,    // Pause stream for 30 days
     Major = 2,    // Terminate stream (plagiarism)
@@ -419,6 +447,7 @@ pub enum ViolationType {
 
 #[contracttype]
 #[derive(Clone)]
+/// Payload submitted for a disciplinary action.
 pub struct DisciplinaryPayload {
     pub student: Address,
     pub course_id: u64,
@@ -431,6 +460,7 @@ pub struct DisciplinaryPayload {
 
 #[contracttype]
 #[derive(Clone)]
+/// Record of a student whose scholarship was slashed.
 pub struct SlashedStudent {
     pub student: Address,
     pub course_id: u64,
@@ -443,6 +473,7 @@ pub struct SlashedStudent {
 
 /// Storage key enumeration for all contract state.
 #[contracttype]
+/// Storage key enumeration for all contract state.
 pub enum DataKey {
     Access(Address, u64),
     BaseRate,
@@ -556,6 +587,7 @@ pub enum DataKey {
 
 #[contracttype]
 #[derive(Clone)]
+/// Allocation of idle capital to a yield strategy.
 pub struct YieldAllocation {
     pub amm: Address,
     pub total_weight: i128,
@@ -565,6 +597,7 @@ pub struct YieldAllocation {
 /// A multi-course subscription granting access to a set of courses until expiry.
 #[contracttype]
 #[derive(Clone)]
+/// A multi-course subscription granting access until expiry.
 pub struct SubscriptionTier {
     pub subscriber: Address,
     pub expiry_time: u64,
@@ -573,6 +606,7 @@ pub struct SubscriptionTier {
 
 #[contracttype]
 #[derive(Clone)]
+/// An on-chain governance referendum.
 pub struct Referendum {
     pub id: u64,
     pub proposer: Address,
@@ -590,6 +624,7 @@ pub struct Referendum {
 /// Metadata for a registered course.
 #[contracttype]
 #[derive(Clone)]
+/// Metadata for a registered course.
 pub struct CourseInfo {
     pub course_id: u64,
     pub created_at: u64,
@@ -600,6 +635,7 @@ pub struct CourseInfo {
 /// The on-chain course registry holding all registered course IDs.
 #[contracttype]
 #[derive(Clone)]
+/// The on-chain course registry holding all registered course IDs.
 pub struct CourseRegistry {
     pub courses: Vec<u64>,
     pub last_updated: u64,
@@ -608,12 +644,14 @@ pub struct CourseRegistry {
 /// Royalty split configuration for a course, mapping recipient addresses to percentage shares.
 #[contracttype]
 #[derive(Clone)]
+/// Royalty split configuration mapping recipients to percentage shares.
 pub struct RoyaltySplit {
     pub shares: Vec<(Address, u32)>,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// Proof of attendance submitted by a student.
 pub struct AttendanceProof {
     pub student: Address,
     pub course_id: u64,
@@ -624,6 +662,7 @@ pub struct AttendanceProof {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// State of an attendance checkpoint.
 pub enum CheckpointState {
     Compliant,
     Pending,
@@ -633,6 +672,7 @@ pub enum CheckpointState {
 
 #[contracttype]
 #[derive(Clone)]
+/// Proof-of-Attendance configuration for a course.
 pub struct PoAConfig {
     pub checkpoint_interval_seconds: u64,
     pub grace_period_seconds: u64,
@@ -643,6 +683,7 @@ pub struct PoAConfig {
 // Slashing Appeal struct (#193)
 #[contracttype]
 #[derive(Clone)]
+/// An appeal submitted against a slashing decision.
 pub struct SlashingAppeal {
     pub student: Address,
     pub counter_oracle: Address,
@@ -654,6 +695,7 @@ pub struct SlashingAppeal {
 // Research Grant Milestone Escrow structs
 #[contracttype]
 #[derive(Clone)]
+/// A single attendance checkpoint within a course.
 pub struct AttendanceCheckpoint {
     pub checkpoint_number: u64,
     pub epoch_start: u64,
@@ -663,6 +705,7 @@ pub struct AttendanceCheckpoint {
 
 #[contracttype]
 #[derive(Clone)]
+/// Aggregated proof-of-attendance state for a student.
 pub struct StudentPoAState {
     pub current_state: CheckpointState,
     pub last_checkpoint_submitted: u64,
@@ -674,6 +717,7 @@ pub struct StudentPoAState {
 /// Daily learning streak data for a student on a specific course.
 #[contracttype]
 #[derive(Clone)]
+/// Daily learning streak data for a student on a specific course.
 pub struct StreakData {
     pub current_streak: u64,
     pub last_watch_date: u64,
@@ -683,6 +727,7 @@ pub struct StreakData {
 /// A group funding pool that allows multiple students to pool tokens for course access.
 #[contracttype]
 #[derive(Clone)]
+/// A group funding pool allowing students to pool tokens for course access.
 pub struct GroupPool {
     pub pool_id: u64,
     pub course_id: u64,
@@ -698,6 +743,7 @@ pub struct GroupPool {
 /// A student's quiz submission proof for a course module.
 #[contracttype]
 #[derive(Clone)]
+/// A student's quiz submission proof for a course module.
 pub struct QuizProof {
     pub student: Address,
     pub course_id: u64,
@@ -710,6 +756,7 @@ pub struct QuizProof {
 
 #[contracttype]
 #[derive(Clone)]
+/// Zero-knowledge proof record for privacy-preserving verification.
 pub struct ZKProofRecord {
     pub student: Address,
     pub course_id: u64,
@@ -721,6 +768,7 @@ pub struct ZKProofRecord {
 
 #[contracttype]
 #[derive(Clone)]
+/// Current academic standing classification for a student.
 pub struct AcademicStanding {
     pub student: Address,
     pub course_id: u64,
@@ -731,6 +779,7 @@ pub struct AcademicStanding {
 
 #[contracttype]
 #[derive(Clone)]
+/// ZK proof that a student's GPA meets a threshold without revealing the exact value.
 pub struct GPAThresholdProof {
     pub a: soroban_sdk::Bytes, // G1 point
     pub b: soroban_sdk::Bytes, // G2 point
@@ -739,6 +788,7 @@ pub struct GPAThresholdProof {
 }
 
 #[derive(Debug)]
+/// Errors returned by zero-knowledge proof operations.
 pub enum ZKError {
     InvalidProof,
     VerificationFailed,
@@ -749,6 +799,7 @@ pub enum ZKError {
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
+/// Errors related to privacy-preserving operations.
 pub enum PrivacyError {
     NullifierAlreadyUsed = 1,
     InvalidCommitment = 2,
@@ -757,6 +808,7 @@ pub enum PrivacyError {
 
 #[contracttype]
 #[derive(Clone)]
+/// A zero-knowledge claim proof submitted by a student.
 pub struct ZKClaimProof {
     pub nullifier: soroban_sdk::BytesN<32>,
     pub commitment: soroban_sdk::BytesN<32>,
@@ -765,6 +817,7 @@ pub struct ZKClaimProof {
 }
 
 #[derive(Debug)]
+/// Errors returned by bounty operations.
 pub enum BountyError {
     MilestoneAlreadyClaimed,
     InsufficientBountyReserve,
@@ -773,6 +826,7 @@ pub enum BountyError {
 }
 
 #[derive(Debug)]
+/// Errors returned by slashing operations.
 pub enum SlashingError {
     UnauthorizedOracle,
     InvalidViolationType,
@@ -782,6 +836,7 @@ pub enum SlashingError {
 }
 
 #[contract]
+/// The main Stream-Scholar Soroban smart contract.
 pub struct ScholarContract;
 
 #[contractimpl]
