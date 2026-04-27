@@ -4563,3 +4563,11 @@ impl ScholarContract {
         env.storage().instance().get(&DataKey::ResearchBonusFund)
     }
 }
+
+// Test modules
+#[cfg(test)]
+mod test;
+
+// Performance benchmark tests (Issue #203)
+#[cfg(test)]
+mod perf_bench;
