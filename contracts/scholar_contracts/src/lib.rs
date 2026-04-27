@@ -112,6 +112,7 @@ pub enum Event {
 }
 
 
+/// On-chain record of a student's time-based access to a single course.
 #[contracttype]
 #[derive(Clone)]
 /// On-chain record of a student's time-based access to a single course.
@@ -143,6 +144,7 @@ pub struct SponsorProfile {
     pub active_capital: i128,
 }
 
+/// On-chain scholarship account for a student.
 #[contracttype]
 #[derive(Clone)]
 /// On-chain scholarship account for a student.
@@ -469,6 +471,7 @@ pub struct SlashedStudent {
     pub original_donor: Address,
 }
 
+/// Storage key enumeration for all contract state.
 #[contracttype]
 /// Storage key enumeration for all contract state.
 pub enum DataKey {
@@ -591,6 +594,7 @@ pub struct YieldAllocation {
     pub last_updated: u64,
 }
 
+/// A multi-course subscription granting access to a set of courses until expiry.
 #[contracttype]
 #[derive(Clone)]
 /// A multi-course subscription granting access until expiry.
@@ -617,6 +621,7 @@ pub struct Referendum {
     pub token: Address,
 }
 
+/// Metadata for a registered course.
 #[contracttype]
 #[derive(Clone)]
 /// Metadata for a registered course.
@@ -627,6 +632,7 @@ pub struct CourseInfo {
     pub creator: Address,
 }
 
+/// The on-chain course registry holding all registered course IDs.
 #[contracttype]
 #[derive(Clone)]
 /// The on-chain course registry holding all registered course IDs.
@@ -635,6 +641,7 @@ pub struct CourseRegistry {
     pub last_updated: u64,
 }
 
+/// Royalty split configuration for a course, mapping recipient addresses to percentage shares.
 #[contracttype]
 #[derive(Clone)]
 /// Royalty split configuration mapping recipients to percentage shares.
@@ -707,6 +714,7 @@ pub struct StudentPoAState {
     pub stream_halted_until: u64,
 }
 
+/// Daily learning streak data for a student on a specific course.
 #[contracttype]
 #[derive(Clone)]
 /// Daily learning streak data for a student on a specific course.
@@ -716,6 +724,7 @@ pub struct StreakData {
     pub total_reward_claimed: i128,
 }
 
+/// A group funding pool that allows multiple students to pool tokens for course access.
 #[contracttype]
 #[derive(Clone)]
 /// A group funding pool allowing students to pool tokens for course access.
@@ -731,6 +740,7 @@ pub struct GroupPool {
     pub created_at: u64,
 }
 
+/// A student's quiz submission proof for a course module.
 #[contracttype]
 #[derive(Clone)]
 /// A student's quiz submission proof for a course module.
