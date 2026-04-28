@@ -614,6 +614,8 @@ pub enum DataKey {
     Referendum(u64),
     ReferendumCount,
     ReferendumVote(u64, Address),
+    CouncilRotationTimelock,
+    LastCouncilRotation,
     // Pre-existing variants used throughout the contract
     StudentProfile(Address),
     OracleStatus(Address),
@@ -784,6 +786,8 @@ pub struct Referendum {
     pub executed: bool,
     pub bond_amount: i128,
     pub token: Address,
+    pub queued_at: Option<u64>,
+    pub vetoed: bool,
 }
 
 /// Metadata for a registered course.
@@ -5496,6 +5500,87 @@ impl ScholarContract {
         env.storage().instance().set(&DataKey::IsPaused, &false);
         env.storage().instance().remove(&DataKey::PauseTimestamp);
     }
+
+    // -------------------------------------------------------------------------
+    // Modular Upgrades Pattern via Multi-Signature Governance
+    // -------------------------------------------------------------------------
+    
+    /// Admin configures the Security Council address. The Security Council acts as the
+    /// multi-signature governance body for critical protocol changes, including upgrades.
+    pub fn set_security_council(env: Env, admin: Address, council: Address) {
+        admin.require_auth();
+        
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        
+        env.storage().instance().set(&DataKey::SecurityCouncil, &council);
+    }
+
+    /// Upgrades the contract's WASM code. Strictly controlled by the Security Council.
+    /// The Security Council is expected to be a multi-signature Stellar account.
+    pub fn upgrade_contract(env: Env, council: Address, new_wasm_hash: BytesN<32>) {
+        council.require_auth();
+        
+        let stored_council: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecurityCouncil)
+            .expect("Security Council not set");
+            
+        if stored_council != council {
+            panic!("Unauthorized: Caller is not the Security Council");
+        }
+        
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// DAO-triggered Council Key Rotation Initiation (requires a referendum)
+    pub fn queue_council_rotation(env: Env, new_council: Address) {
+        // Only the contract itself can call this (meaning it passed via a referendum execute_referendum)
+        env.current_contract_address().require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        let last_rotation: u64 = env.storage().instance().get(&DataKey::LastCouncilRotation).unwrap_or(0);
+        
+        // Ensure at least 365 days (31536000 seconds) have passed
+        if last_rotation > 0 && current_time < last_rotation + 31536000 {
+            panic!("Cannot rotate keys yet: 1 year has not passed");
+        }
+        
+        let execution_time = current_time + 604800; // 7-day timelock
+        env.storage().instance().set(&DataKey::CouncilRotationTimelock, &(new_council, execution_time));
+    }
+
+    /// Executes the queued rotation after the 7-day timelock
+    pub fn execute_council_rotation(env: Env) {
+        let (new_council, execution_time): (Address, u64) = env.storage().instance()
+            .get(&DataKey::CouncilRotationTimelock)
+            .expect("No rotation queued");
+            
+        let current_time = env.ledger().timestamp();
+        if current_time < execution_time {
+            panic!("Timelock has not expired");
+        }
+        
+        env.storage().instance().set(&DataKey::SecurityCouncil, &new_council);
+        env.storage().instance().set(&DataKey::LastCouncilRotation, &current_time);
+        env.storage().instance().remove(&DataKey::CouncilRotationTimelock);
+    }
+
+    /// Emergency dissolve council callable only by DAO referendum. Bypasses timelock.
+    pub fn emergency_dissolve_council(env: Env) {
+        env.current_contract_address().require_auth();
+        // Remove or disable council
+        env.storage().instance().remove(&DataKey::SecurityCouncil);
+        // Clear any pending rotation
+        env.storage().instance().remove(&DataKey::CouncilRotationTimelock);
+    }
     
     // -------------------------------------------------------------------------
     // Modular Upgrades Pattern via Multi-Signature Governance
@@ -5738,26 +5823,24 @@ impl ScholarContract {
             .unwrap_or(0);
         let ref_id = count + 1;
         let end_time = env.ledger().timestamp() + 604800; // 7 days voting period
-
-        let referendum = Referendum {
-            id: ref_id,
-            proposer,
-            target_contract,
-            function,
-            args,
-            end_time,
-            yes_votes: 0,
-            no_votes: 0,
-            executed: false,
-            bond_amount,
+        
+        let referendum = Referendum { 
+            id: ref_id, 
+            proposer, 
+            target_contract, 
+            function, 
+            args, 
+            end_time, 
+            yes_votes: 0, 
+            no_votes: 0, 
+            executed: false, 
+            bond_amount, 
             token,
+            queued_at: None,
+            vetoed: false,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::ReferendumCount, &ref_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Referendum(ref_id), &referendum);
+        env.storage().instance().set(&DataKey::ReferendumCount, &ref_id);
+        env.storage().persistent().set(&DataKey::Referendum(ref_id), &referendum);
         ref_id
     }
 
@@ -5792,44 +5875,54 @@ impl ScholarContract {
             .set(&DataKey::Referendum(ref_id), &referendum);
     }
 
+    pub fn queue_referendum(env: Env, caller: Address, ref_id: u64) {
+        caller.require_auth();
+        let mut referendum: Referendum = env.storage().persistent().get(&DataKey::Referendum(ref_id)).expect("Referendum not found");
+        if env.ledger().timestamp() < referendum.end_time { panic!("Voting period active"); }
+        if referendum.executed { panic!("Already executed"); }
+        if referendum.queued_at.is_some() { panic!("Already queued"); }
+        if referendum.yes_votes <= referendum.no_votes { panic!("Referendum did not pass"); }
+        if referendum.vetoed { panic!("Referendum has been vetoed"); }
+        
+        referendum.queued_at = Some(env.ledger().timestamp());
+        env.storage().persistent().set(&DataKey::Referendum(ref_id), &referendum);
+    }
+
     pub fn execute_referendum(env: Env, caller: Address, ref_id: u64) {
         caller.require_auth();
-        let mut referendum: Referendum = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Referendum(ref_id))
-            .expect("Referendum not found");
-        if env.ledger().timestamp() < referendum.end_time {
-            panic!("Voting period active");
-        }
-        if referendum.executed {
-            panic!("Already executed");
-        }
-
+        let mut referendum: Referendum = env.storage().persistent().get(&DataKey::Referendum(ref_id)).expect("Referendum not found");
+        if referendum.executed { panic!("Already executed"); }
+        if referendum.vetoed { panic!("Referendum has been vetoed"); }
+        
+        let queued_at = referendum.queued_at.unwrap_or_else(|| panic!("Referendum not queued"));
+        let current_time = env.ledger().timestamp();
+        // Enforce 72-hour delay (259200 seconds)
+        if current_time < queued_at + 259200 { panic!("Execution delay not met"); }
+        
         referendum.executed = true;
         env.storage()
             .persistent()
             .set(&DataKey::Referendum(ref_id), &referendum);
 
         let client = token::Client::new(&env, &referendum.token);
-        client.transfer(
-            &env.current_contract_address(),
-            &referendum.proposer,
-            &referendum.bond_amount,
-        );
+        client.transfer(&env.current_contract_address(), &referendum.proposer, &referendum.bond_amount);
+        
+        env.invoke_contract::<soroban_sdk::Val>(&referendum.target_contract, &referendum.function, referendum.args.clone());
+        env.events().publish((Symbol::new(&env, "ReferendumExecuted"), ref_id), true);
+    }
 
-        if referendum.yes_votes > referendum.no_votes {
-            env.invoke_contract::<soroban_sdk::Val>(
-                &referendum.target_contract,
-                &referendum.function,
-                referendum.args.clone(),
-            );
-            env.events()
-                .publish((Symbol::new(&env, "ReferendumExecuted"), ref_id), true);
-        } else {
-            env.events()
-                .publish((Symbol::new(&env, "ReferendumExecuted"), ref_id), false);
-        }
+    pub fn veto_action(env: Env, council: Address, ref_id: u64) {
+        council.require_auth();
+        
+        let stored_council: Address = env.storage().instance().get(&DataKey::SecurityCouncil).expect("Security Council not set");
+        if stored_council != council { panic!("Unauthorized: Caller is not the Security Council"); }
+        
+        let mut referendum: Referendum = env.storage().persistent().get(&DataKey::Referendum(ref_id)).expect("Referendum not found");
+        if referendum.executed { panic!("Cannot veto already executed referendum"); }
+        
+        referendum.vetoed = true;
+        env.storage().persistent().set(&DataKey::Referendum(ref_id), &referendum);
+        env.events().publish((Symbol::new(&env, "GovernanceVetoExecuted"), ref_id), referendum.function);
     }
 
     // Utility functions for testing and configuration
