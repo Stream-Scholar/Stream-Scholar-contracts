@@ -9,6 +9,8 @@ use soroban_sdk::{
     BytesN, Env, IntoVal, Symbol, Vec,
 };
 
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, token};
+
 // Constants for ledger bump and GPA bonus calculations
 const LEDGER_BUMP_THRESHOLD: u32 = 7776000; // ~90 days
 const LEDGER_BUMP_EXTEND: u32 = 7776000; // ~90 days
@@ -850,6 +852,23 @@ pub struct SlashingAppeal {
     pub submitted_at: u64,
     pub is_resolved: bool,
     pub appeal_granted: bool,
+}
+
+// Issue #261: Helper functions for bounded vector validation
+impl DeansCouncil {
+    fn validate_members(members: &Vec<Address>) -> bool {
+        members.len() <= MAX_BOARD_MEMBERS as usize && !members.is_empty()
+    }
+    
+    fn validate_signatures(required_signatures: u32, member_count: usize) -> bool {
+        required_signatures > 0 && required_signatures <= member_count as u32
+    }
+}
+
+impl BoardPauseRequest {
+    fn validate_signatures(signatures: &Vec<Address>) -> bool {
+        signatures.len() <= MAX_SIGNATURES_PER_REQUEST as usize
+    }
 }
 
 // Research Grant Milestone Escrow structs
@@ -6024,6 +6043,7 @@ impl ScholarContract {
             (Symbol::new(&env, "YieldStrategyUpdated"), alumni.clone()),
             (target_amm.clone(), weight),
         );
+        }
     }
 
     /// Routes idle capital to the AMM that won the alumni vote.
