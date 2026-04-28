@@ -95,6 +95,9 @@ const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 const SECURITY_HOLD_DURATION: u64 = 7 * 24 * 60 * 60;
 
 mod issue_features;
+mod formal_verification;
+mod fuzz_verification;
+mod permutation_harness;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Internal contract event variants.
