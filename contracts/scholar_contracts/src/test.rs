@@ -2442,6 +2442,106 @@ fn test_sac_reconcile_rejects_mismatched_evidence() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_refinance_grant_mid_semester() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let old_sponsor = Address::generate(&env);
+    let new_sponsor = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&old_sponsor, &1_000);
+    token_client.mint(&new_sponsor, &2_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_kyc_status(&admin, &new_sponsor, &true);
+
+    client.fund_scholarship(&old_sponsor, &student, &500, &token_address.address(), &false);
+    client.create_stream(
+        &old_sponsor,
+        &student,
+        &1_i128,
+        &token_address.address(),
+        &Option::<Symbol>::None,
+    );
+
+    let sponsor_old_balance_before = token_client.balance(&old_sponsor);
+    let sponsor_new_balance_before = token_client.balance(&new_sponsor);
+
+    let refined_amount = client.refinance_grant(
+        &student,
+        &old_sponsor,
+        &new_sponsor,
+        &token_address.address(),
+        &soroban_sdk::BytesN::from_array(&env, &[1u8; 64]),
+        &soroban_sdk::Bytes::from_slice(&env, b"refinance consent"),
+    );
+
+    assert_eq!(refined_amount, 500);
+    assert_eq!(client.get_scholarship(&student).funder, new_sponsor);
+    assert_eq!(client.get_sponsor_mapping(&student), new_sponsor);
+    assert_eq!(token_client.balance(&old_sponsor), sponsor_old_balance_before + 500);
+    assert_eq!(token_client.balance(&new_sponsor), sponsor_new_balance_before - 505);
+    assert_eq!(client.get_protocol_fees_accrued(&token_address.address()), 5);
+
+    env.ledger().set_timestamp(20);
+    let withdrawn = client.withdraw_from_stream(&student, &new_sponsor, &token_address.address());
+    assert_eq!(withdrawn, 20);
+    assert_eq!(client.get_scholarship(&student).funder, new_sponsor);
+}
+
+#[test]
+fn test_refinance_grant_fails_when_kyc_not_verified() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let old_sponsor = Address::generate(&env);
+    let new_sponsor = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&old_sponsor, &1_000);
+    token_client.mint(&new_sponsor, &1_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.fund_scholarship(&old_sponsor, &student, &500, &token_address.address(), &false);
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "refinance_grant"),
+        Vec::from_array(
+            &env,
+            [
+                student.clone().into_val(&env),
+                old_sponsor.clone().into_val(&env),
+                new_sponsor.clone().into_val(&env),
+                token_address.address().into_val(&env),
+                soroban_sdk::BytesN::from_array(&env, &[1u8; 64]).into_val(&env),
+                soroban_sdk::Bytes::from_slice(&env, b"refinance consent").into_val(&env),
+            ],
+        ),
+    );
+
+    assert!(result.is_err());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #209 — Final E2E Integration Test (Oracle to Yield)
 //

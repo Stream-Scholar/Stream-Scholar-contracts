@@ -79,6 +79,7 @@ const QUADRATIC_ROUND_DURATION: u64 = 2592000; // 30-day voting round
 // Issue #197: Dynamic Fee Adjustment via DAO
 const MAX_FEE_BPS: u32 = 500; // 5% maximum fee cap
 const FEE_EPOCH_DURATION: u64 = 2592000; // 30-day epoch between fee updates
+const REFINANCE_FEE_BPS: u32 = 100; // 1% protocol fee on grant refinancings
 
 use expiry_math::checked_access_expiry;
 
@@ -649,6 +650,8 @@ pub enum DataKey {
     ResearchBonusFund,
     SurpriseBonusRecipient(u64),
     AlumniPledge(Address),
+    SponsorMapping(Address),
+    KycVerified(Address),
     SponsorProfile(Address),
     CrossChainMessage(BytesN<32>),
     Stream(Address, Address),
@@ -1015,6 +1018,19 @@ pub enum ScholarErr {
     OracleDataStale = 3,
     ReplayAttack = 4,
     InvalidOracleSig = 5,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RefinanceError {
+    ScholarshipNotFound = 30,
+    UnauthorizedSponsor = 31,
+    InsufficientFunds = 32,
+    KycNotVerified = 33,
+    InvalidStudentConsent = 34,
+    StreamAlreadyExists = 35,
+    InvalidRefinanceRequest = 36,
 }
 
 #[contracterror]
@@ -1892,8 +1908,194 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SponsorMapping(student.clone()), &funder);
 
         Self::upsert_scholarship_index(&env, &student);
+    }
+
+    fn current_refinance_payload(
+        _env: &Env,
+        _student: &Address,
+        _old_sponsor: &Address,
+        _new_sponsor: &Address,
+        _remaining_balance: i128,
+        _token: &Address,
+        request_payload: &Bytes,
+    ) -> Bytes {
+        request_payload.clone()
+    }
+
+    fn verify_student_refinance_consent(
+        env: &Env,
+        student: &Address,
+        payload: &Bytes,
+        signature: &BytesN<64>,
+    ) {
+        if signature == soroban_sdk::BytesN::from_array(env, &[0u8; 64]) {
+            env.panic_with_error(RefinanceError::InvalidStudentConsent);
+        }
+
+        // Placeholder: In production this would verify an Ed25519 signature from the
+        // student's public key over the refinancing payload.
+        let _ = (student, payload, signature);
+    }
+
+    fn check_kyc_status(env: &Env, sponsor: &Address) -> Result<(), RefinanceError> {
+        let verified: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycVerified(sponsor.clone()))
+            .unwrap_or(false);
+        if verified {
+            Ok(())
+        } else {
+            Err(RefinanceError::KycNotVerified)
+        }
+    }
+
+    pub fn set_kyc_status(env: Env, admin: Address, sponsor: Address, verified: bool) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error(ScholarErr::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::KycVerified(sponsor), &verified);
+    }
+
+    pub fn refinance_grant(
+        env: Env,
+        student: Address,
+        old_sponsor: Address,
+        new_sponsor: Address,
+        token: Address,
+        student_signature: BytesN<64>,
+        request_payload: Bytes,
+    ) -> i128 {
+        new_sponsor.require_auth();
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .unwrap_or_else(|| env.panic_with_error(RefinanceError::ScholarshipNotFound));
+
+        if scholarship.funder != old_sponsor {
+            env.panic_with_error(RefinanceError::UnauthorizedSponsor);
+        }
+
+        if old_sponsor == new_sponsor {
+            env.panic_with_error(RefinanceError::InvalidRefinanceRequest);
+        }
+
+        if scholarship.token != token {
+            env.panic_with_error(RefinanceError::InvalidRefinanceRequest);
+        }
+
+        Self::check_kyc_status(&env, &new_sponsor).unwrap_or_else(|err| env.panic_with_error(err));
+
+        let remaining_balance = scholarship.balance;
+        if remaining_balance <= 0 {
+            env.panic_with_error(RefinanceError::InvalidRefinanceRequest);
+        }
+
+        let payload = Self::current_refinance_payload(
+            &env,
+            &student,
+            &old_sponsor,
+            &new_sponsor,
+            remaining_balance,
+            &token,
+            &request_payload,
+        );
+        Self::verify_student_refinance_consent(&env, &student, &payload, &student_signature);
+
+        let fee_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, remaining_balance, REFINANCE_FEE_BPS as i128),
+            10000,
+        );
+        let total_payment = safe_math::add_i128(&env, remaining_balance, fee_amount);
+
+        let token_client = token::Client::new(&env, &token);
+        let new_sponsor_balance = token_client.balance(&new_sponsor);
+        if new_sponsor_balance < total_payment {
+            env.panic_with_error(RefinanceError::InsufficientFunds);
+        }
+
+        token_client.transfer(&new_sponsor, &old_sponsor, &remaining_balance);
+        if fee_amount > 0 {
+            token_client.transfer(&new_sponsor, &env.current_contract_address(), &fee_amount);
+            let existing_fees: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolFeesAccrued(token.clone()))
+                .unwrap_or(0);
+            let updated_fees = safe_math::add_i128(&env, existing_fees, fee_amount);
+            env.storage()
+                .instance()
+                .set(&DataKey::ProtocolFeesAccrued(token.clone()), &updated_fees);
+        }
+
+        scholarship.funder = new_sponsor.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SponsorMapping(student.clone()), &new_sponsor);
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Stream(old_sponsor.clone(), student.clone()))
+        {
+            let mut stream: Stream = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Stream(old_sponsor.clone(), student.clone()))
+                .unwrap();
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Stream(new_sponsor.clone(), student.clone()))
+            {
+                env.panic_with_error(RefinanceError::StreamAlreadyExists);
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Stream(old_sponsor.clone(), student.clone()));
+            stream.funder = new_sponsor.clone();
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stream(new_sponsor.clone(), student.clone()), &stream);
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "GrantRefinanced"),
+                old_sponsor.clone(),
+                new_sponsor.clone(),
+            ),
+            remaining_balance,
+        );
+
+        remaining_balance
+    }
+
+    pub fn get_sponsor_mapping(env: Env, student: Address) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SponsorMapping(student.clone()))
+            .unwrap_or_else(|| env.panic_with_error(RefinanceError::ScholarshipNotFound))
     }
 
     /// Withdraws tokens from a student's scholarship balance.
