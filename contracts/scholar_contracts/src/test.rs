@@ -634,7 +634,7 @@ fn test_calculate_remaining_airtime() {
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
 
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // 500 balance / 10 base_rate = 50 seconds
     assert_eq!(client.calculate_remaining_airtime(&student), 50);
@@ -696,7 +696,7 @@ fn test_withdrawal_whitelisting() {
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
 
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // Set whitelisted address
     env.ledger().set_timestamp(0);
@@ -2321,6 +2321,17 @@ fn test_private_claim_logic() {
 //   ✓ Protocol is validated as "Mainnet Ready".
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Mock oracle contract for academic progress verification
+#[contract]
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn check_status(_env: Env, _student: Address, course_id: u64) -> u32 {
+        if course_id == 1 { 1 } else if course_id == 2 { 0 } else { 2 }
+    }
+}
+
 #[test]
 fn test_e2e_oracle_to_yield_full_lifecycle() {
     let env = Env::default();
@@ -2366,7 +2377,7 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     //   university gets 7,000 (transferred immediately)
     //   student scholarship balance = 3,000
     let donor_balance_before = token.balance(&donor);
-    client.fund_scholarship(&donor, &student, &10_000, &token_addr.address());
+    client.fund_scholarship(&donor, &student, &10_000, &token_addr.address(), &false);
 
     assert_eq!(token.balance(&donor), donor_balance_before - 10_000,
         "Donor should have paid 10,000 tokens");
@@ -2509,4 +2520,137 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     // ── Protocol is "Mainnet Ready" ───────────────────────────────────────────
     // All assertions passed: the protocol handles the full lifecycle without
     // panics, logic collisions, or token leakage.
+}
+
+// ── Issue #262: Anti-frontrunning commit-reveal tests ────────────────────────
+
+/// Helper: build the sha256 commit hash the same way the contract does.
+fn make_commit_hash(
+    env: &Env,
+    scholarship_id: &Address,
+    amount: i128,
+    salt: &soroban_sdk::BytesN<32>,
+) -> soroban_sdk::BytesN<32> {
+    let mut preimage = soroban_sdk::Bytes::new(env);
+    preimage.append(&scholarship_id.to_xdr(env));
+    for b in amount.to_be_bytes() {
+        preimage.push_back(b);
+    }
+    preimage.append(&soroban_sdk::Bytes::from_slice(env, salt.as_slice()));
+    env.crypto().sha256(&preimage).into()
+}
+
+#[test]
+fn test_commit_reveal_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let scholarship_id = Address::generate(&env);
+    let salt = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    let amount: i128 = 500;
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Phase 1: commit at t=0
+    env.ledger().set_timestamp(0);
+    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
+    client.commit_scholarship_application(&student, &commit_hash);
+
+    // Phase 2: reveal after min delay (t=10 > COMMIT_MIN_DELAY=5)
+    env.ledger().set_timestamp(10);
+    client.reveal_scholarship_application(&student, &scholarship_id, &amount, &salt);
+}
+
+#[test]
+#[should_panic]
+fn test_reveal_too_early_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let scholarship_id = Address::generate(&env);
+    let salt = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let amount: i128 = 100;
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    env.ledger().set_timestamp(0);
+    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
+    client.commit_scholarship_application(&student, &commit_hash);
+
+    // Reveal at t=3, before COMMIT_MIN_DELAY=5 — must panic
+    env.ledger().set_timestamp(3);
+    client.reveal_scholarship_application(&student, &scholarship_id, &amount, &salt);
+}
+
+#[test]
+#[should_panic]
+fn test_reveal_expired_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let scholarship_id = Address::generate(&env);
+    let salt = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+    let amount: i128 = 200;
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    env.ledger().set_timestamp(0);
+    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
+    client.commit_scholarship_application(&student, &commit_hash);
+
+    // Reveal at t=3601, after COMMIT_EXPIRY=3600 — must panic
+    env.ledger().set_timestamp(3601);
+    client.reveal_scholarship_application(&student, &scholarship_id, &amount, &salt);
+}
+
+#[test]
+#[should_panic]
+fn test_reveal_wrong_hash_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let scholarship_id = Address::generate(&env);
+    let salt = soroban_sdk::BytesN::from_array(&env, &[3u8; 32]);
+    let amount: i128 = 300;
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    env.ledger().set_timestamp(0);
+    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
+    client.commit_scholarship_application(&student, &commit_hash);
+
+    // Reveal with wrong amount — hash mismatch must panic
+    env.ledger().set_timestamp(10);
+    client.reveal_scholarship_application(&student, &scholarship_id, &999i128, &salt);
+}
+
+#[test]
+#[should_panic]
+fn test_reveal_without_commit_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let scholarship_id = Address::generate(&env);
+    let salt = soroban_sdk::BytesN::from_array(&env, &[4u8; 32]);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    // No commit — reveal must panic with CommitNotFound
+    env.ledger().set_timestamp(10);
+    client.reveal_scholarship_application(&student, &scholarship_id, &100i128, &salt);
 }

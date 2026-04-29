@@ -92,6 +92,10 @@ const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 /// Duration of a university-triggered security hold (7 days).
 const SECURITY_HOLD_DURATION: u64 = 7 * 24 * 60 * 60;
 
+// Issue #262: Anti-frontrunning commit-reveal constants
+const COMMIT_MIN_DELAY: u64 = 5;       // minimum ledger seconds before reveal is allowed
+const COMMIT_EXPIRY: u64 = 3600;       // commit expires after 1 hour
+
 mod issue_features;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +184,8 @@ pub struct StudentProfile {
 #[derive(Clone)]
 pub struct StudentGPA {
     pub gpa: u64,
+    pub last_updated: u64,
+    pub oracle_verified: bool,
 }
 
 #[contracttype]
@@ -686,6 +692,40 @@ pub enum DataKey {
     CommitteeApprovalBitmap(Address, u64, u64),
     GrantCommitteeNonce(Address, u64),
     MilestoneReviewSession(Address, u64, u64),
+    // Issue #262: Anti-frontrunning commit-reveal for scholarship applications
+    AppCommit(Address),  // student -> ApplicationCommit
+    AppReveal(Address),  // student -> ApplicationReveal
+    // Missing DataKeys for pre-existing functions
+    AcademicOracle,
+    TuitionStipendSplit(Address), // student -> TuitionStipendSplit
+}
+
+// Issue #262: Anti-frontrunning commit-reveal structs
+/// Phase-1 commitment: stores the hash and the ledger time of the commit.
+#[contracttype]
+#[derive(Clone)]
+pub struct ApplicationCommit {
+    pub commit_hash: BytesN<32>,
+    pub committed_at: u64,
+}
+
+/// Phase-2 reveal: the plaintext inputs whose hash must match the commitment.
+#[contracttype]
+#[derive(Clone)]
+pub struct ApplicationReveal {
+    pub scholarship_id: Address,
+    pub amount: i128,
+    pub salt: BytesN<32>,
+}
+
+/// Tuition-stipend split configuration for a student.
+#[contracttype]
+#[derive(Clone)]
+pub struct TuitionStipendSplit {
+    pub university_address: Address,
+    pub student_address: Address,
+    pub university_percentage: u32,
+    pub student_percentage: u32,
 }
 
 #[contracttype]
@@ -964,6 +1004,11 @@ pub enum ScholarErr {
     OracleDataStale = 3,
     ReplayAttack = 4,
     InvalidOracleSig = 5,
+    // Issue #262: Anti-frontrunning errors
+    CommitNotFound = 6,
+    RevealTooEarly = 7,
+    RevealExpired = 8,
+    CommitHashMismatch = 9,
 }
 
 #[contracterror]
@@ -3907,11 +3952,27 @@ impl ScholarContract {
         }
     }
 
-    fn distribute_tuition_stipend_split(env: &Env, _student: &Address, amount: i128, _token: &Address) -> (i128, i128) {
-        // Placeholder for split logic (70/30)
-        let university_share = (amount * 70) / 100;
-        let student_share = amount - university_share;
-        (university_share, student_share)
+    fn distribute_tuition_stipend_split(env: &Env, student: &Address, amount: i128, token: &Address) -> (i128, i128) {
+        let split: Option<TuitionStipendSplit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TuitionStipendSplit(student.clone()));
+        if let Some(config) = split {
+            let university_share = (amount * config.university_percentage as i128) / 100;
+            let student_share = amount - university_share;
+            if university_share > 0 {
+                let client = token::Client::new(env, token);
+                client.transfer(
+                    &env.current_contract_address(),
+                    &config.university_address,
+                    &university_share,
+                );
+            }
+            (university_share, student_share)
+        } else {
+            // No split configured — all goes to student
+            (0, amount)
+        }
     }
 
     fn apply_attendance_penalty_to_rate(_env: Env, _student: Address, rate: i128) -> i128 {
@@ -4996,6 +5057,456 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .set(&DataKey::Subscription(subscriber), &tier);
+    }
+
+    /// Set the contract admin (can only be called once).
+    pub fn set_admin(env: Env, admin: Address) {
+        admin.require_auth();
+        let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if existing.is_some() {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    /// Transfer scholarship funds to an approved teacher.
+    pub fn transfer_scholarship_to_teacher(
+        env: Env,
+        student: Address,
+        teacher: Address,
+        amount: i128,
+    ) {
+        student.require_auth();
+        let is_approved: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IsTeacher(teacher.clone()))
+            .unwrap_or(false);
+        if !is_approved {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+        if scholarship.is_paused {
+            panic!("Scholarship is paused");
+        }
+        if scholarship.unlocked_balance < amount || scholarship.balance < amount {
+            panic!("Insufficient balance");
+        }
+        scholarship.balance -= amount;
+        scholarship.unlocked_balance -= amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student), &scholarship);
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &teacher, &amount);
+    }
+
+    /// Globally veto a course (admin only).
+    pub fn veto_course_globally(env: Env, admin: Address, course_id: u64, status: bool) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::VetoedCourseGlobal(course_id), &status);
+    }
+
+    /// Veto a specific student's access to a course (admin only).
+    pub fn veto_course_access(env: Env, admin: Address, student: Address, course_id: u64) {
+        admin.require_auth();
+        let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if stored_admin.is_none() || stored_admin.unwrap() != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::VetoedCourse(student.clone(), course_id), &true);
+        let access_key = DataKey::Access(student.clone(), course_id);
+        if let Some(mut access) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Access>(&access_key)
+        {
+            access.expiry_time = 0;
+            env.storage().persistent().set(&access_key, &access);
+        }
+    }
+
+    /// Add a course to the on-chain registry.
+    pub fn add_course_to_registry(env: Env, course_id: u64, creator: Address) {
+        creator.require_auth();
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, CourseInfo>(&DataKey::CourseInfo(course_id))
+            .is_some()
+        {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        let registry_size: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CourseRegistrySize)
+            .unwrap_or(0);
+        if registry_size >= MAX_COURSE_REGISTRY_SIZE {
+            panic!("LimitExceeded");
+        }
+        let now = env.ledger().timestamp();
+        let info = CourseInfo { course_id, created_at: now, is_active: true, creator };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CourseInfo(course_id), &info);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CourseRegistrySize, &(registry_size + 1));
+    }
+
+    /// Set the academic oracle address (admin only).
+    pub fn set_academic_oracle(env: Env, admin: Address, oracle: Address) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::AcademicOracle, &oracle);
+    }
+
+    /// Report a student's GPA (oracle only).
+    pub fn report_student_gpa(env: Env, oracle: Address, student: Address, gpa: u64) {
+        oracle.require_auth();
+        let stored_oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AcademicOracle)
+            .expect("Academic Oracle not set");
+        if stored_oracle != oracle {
+            panic!("Unauthorized: Not the academic oracle");
+        }
+        if gpa > 44 {
+            panic!("Invalid GPA");
+        }
+        let now = env.ledger().timestamp();
+        let gpa_data = StudentGPA { gpa, last_updated: now, oracle_verified: true };
+        env.storage()
+            .persistent()
+            .set(&DataKey::StudentGPA(student.clone()), &gpa_data);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StudentGPA(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Get a student's GPA record.
+    pub fn get_student_gpa(env: Env, student: Address) -> Option<StudentGPA> {
+        let key = DataKey::StudentGPA(student.clone());
+        let data = env.storage().persistent().get(&key);
+        if data.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        data
+    }
+
+    /// Get a student's GPA bonus percentage.
+    pub fn get_student_gpa_bonus(env: Env, student: Address) -> u64 {
+        Self::calculate_gpa_bonus(env, student)
+    }
+
+    fn calculate_gpa_bonus(env: Env, student: Address) -> u64 {
+        let gpa_data: Option<StudentGPA> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StudentGPA(student));
+        if let Some(info) = gpa_data {
+            if info.oracle_verified && info.gpa > GPA_BONUS_THRESHOLD {
+                let above = info.gpa - GPA_BONUS_THRESHOLD;
+                return (above * GPA_BONUS_PERCENTAGE_PER_POINT) / 10;
+            }
+        }
+        0
+    }
+
+    /// Get a student's scholarship record.
+    pub fn get_scholarship(env: Env, student: Address) -> Scholarship {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student))
+            .expect("No scholarship found")
+    }
+
+    /// Configure the tuition-stipend split for a student (admin only).
+    pub fn set_tuition_stipend_split(
+        env: Env,
+        admin: Address,
+        student: Address,
+        university: Address,
+        university_percentage: u32,
+        student_percentage: u32,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        if university_percentage + student_percentage != 100 {
+            panic!("Percentages must sum to 100");
+        }
+        let split = TuitionStipendSplit {
+            university_address: university,
+            student_address: student.clone(),
+            university_percentage,
+            student_percentage,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TuitionStipendSplit(student.clone()), &split);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TuitionStipendSplit(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Set the streak bonus amount (admin only).
+    pub fn set_streak_bonus_amount(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        env.storage().instance().set(&DataKey::StreakBonusAmount, &amount);
+    }
+
+    /// Update a student's learning streak for a course.
+    pub fn update_learning_streak(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+        let now = env.ledger().timestamp();
+        let seconds_in_day: u64 = 86400;
+        let mut streak: StreakData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ConsecutiveDays(student.clone(), course_id))
+            .unwrap_or(StreakData { current_streak: 0, last_watch_date: 0, total_reward_claimed: 0 });
+        if streak.last_watch_date == 0 {
+            streak.current_streak = 1;
+        } else {
+            let days_since = (now - streak.last_watch_date) / seconds_in_day;
+            if days_since == 1 {
+                streak.current_streak += 1;
+            } else if days_since > 1 {
+                streak.current_streak = 1;
+            }
+        }
+        streak.last_watch_date = now;
+        // Credit reward when streak hits 5
+        if streak.current_streak == 5 {
+            let bonus: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::StreakBonusAmount)
+                .unwrap_or(100_000_000);
+            streak.total_reward_claimed += bonus;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ConsecutiveDays(student.clone(), course_id), &streak);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ConsecutiveDays(student, course_id),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Get a student's learning streak for a course.
+    pub fn get_learning_streak(env: Env, student: Address, course_id: u64) -> StreakData {
+        let key = DataKey::ConsecutiveDays(student.clone(), course_id);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(StreakData { current_streak: 0, last_watch_date: 0, total_reward_claimed: 0 })
+        } else {
+            StreakData { current_streak: 0, last_watch_date: 0, total_reward_claimed: 0 }
+        }
+    }
+
+    /// Check if a student is PoA-compliant for a course.
+    pub fn check_poa_compliance(env: Env, student: Address, course_id: u64) -> bool {
+        let key = DataKey::StudentPoAState(student, course_id);
+        let state: Option<StudentPoAState> = env.storage().persistent().get(&key);
+        match state {
+            Some(s) => s.current_state == CheckpointState::Compliant || s.current_state == CheckpointState::Pending,
+            None => true, // No PoA configured → compliant by default
+        }
+    }
+
+    /// Get a student's PoA state for a course.
+    pub fn get_student_poa_state(env: Env, student: Address, course_id: u64) -> StudentPoAState {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StudentPoAState(student, course_id))
+            .unwrap_or(StudentPoAState {
+                current_state: CheckpointState::Compliant,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: 0,
+            })
+    }
+
+    /// Pro-rated refund for early course drop (within EARLY_DROP_WINDOW_SECONDS).
+    pub fn pro_rated_refund(env: Env, student: Address, course_id: u64) -> i128 {
+        student.require_auth();
+
+        let access_key = DataKey::Access(student.clone(), course_id);
+        let mut access: Access = env
+            .storage()
+            .persistent()
+            .get(&access_key)
+            .expect("No access record found");
+
+        let current_time = env.ledger().timestamp();
+
+        if current_time > access.last_purchase_time + EARLY_DROP_WINDOW_SECONDS {
+            panic!("Refund only available within the early-drop window");
+        }
+
+        if current_time >= access.expiry_time {
+            return 0;
+        }
+
+        let remaining_seconds = access.expiry_time - current_time;
+        let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
+        let refund_amount = (remaining_seconds as i128) * rate;
+
+        access.expiry_time = 0;
+        env.storage().persistent().set(&access_key, &access);
+
+        let client = token::Client::new(&env, &access.token);
+        client.transfer(&env.current_contract_address(), &student, &refund_amount);
+
+        refund_amount
+    }
+
+    // Issue #262: Anti-frontrunning commit-reveal for scholarship applications
+
+    /// Phase 1 – commit.  The student submits `commit_hash = sha256(scholarship_id || amount || salt)`
+    /// without revealing the plaintext.  Validators cannot front-run the application because they
+    /// do not know the target scholarship or amount until the reveal step.
+    pub fn commit_scholarship_application(env: Env, student: Address, commit_hash: BytesN<32>) {
+        student.require_auth();
+        let committed_at = env.ledger().timestamp();
+        let commit = ApplicationCommit { commit_hash, committed_at };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppCommit(student.clone()), &commit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AppCommit(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Phase 2 – reveal.  The student submits the plaintext inputs.  The contract:
+    /// 1. Checks a commit exists.
+    /// 2. Enforces the minimum delay (prevents same-block front-running).
+    /// 3. Enforces the expiry window (stale commits are rejected).
+    /// 4. Recomputes the hash and compares it to the stored commitment.
+    /// 5. Stores the verified reveal and cleans up the commit.
+    pub fn reveal_scholarship_application(
+        env: Env,
+        student: Address,
+        scholarship_id: Address,
+        amount: i128,
+        salt: BytesN<32>,
+    ) {
+        student.require_auth();
+
+        let commit: ApplicationCommit = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppCommit(student.clone()))
+            .unwrap_or_else(|| env.panic_with_error(ScholarErr::CommitNotFound));
+
+        let now = env.ledger().timestamp();
+
+        if now < commit.committed_at.saturating_add(COMMIT_MIN_DELAY) {
+            env.panic_with_error(ScholarErr::RevealTooEarly);
+        }
+
+        if now > commit.committed_at.saturating_add(COMMIT_EXPIRY) {
+            env.panic_with_error(ScholarErr::RevealExpired);
+        }
+
+        // Recompute hash: sha256(scholarship_id_xdr || amount_be || salt)
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&scholarship_id.clone().to_xdr(&env));
+        for b in amount.to_be_bytes() {
+            preimage.push_back(b);
+        }
+        preimage.append(&Bytes::from_slice(&env, salt.as_slice()));
+        let expected: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        if expected != commit.commit_hash {
+            env.panic_with_error(ScholarErr::CommitHashMismatch);
+        }
+
+        // Persist the verified reveal and remove the one-time commit
+        let reveal = ApplicationReveal { scholarship_id, amount, salt };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppReveal(student.clone()), &reveal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AppReveal(student.clone()),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AppCommit(student));
     }
 }
 
