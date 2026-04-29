@@ -2780,3 +2780,372 @@ fn test_council_rotation_and_dissolve() {
     );
     assert!(result_dissolve.is_ok());
 }
+
+// Rate Limiting Tests
+#[test]
+fn test_claim_scholarship_rate_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy a token for testing
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&admin, &10000);
+
+    // Deploy the scholarship contract
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize the contract
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund the contract
+    token_client.mint(&contract_id, &1000);
+
+    // Create a scholarship for the student
+    client.create_scholarship(&student, &token_address.address(), &500);
+
+    // Set initial time
+    env.ledger().set_timestamp(1000);
+
+    // First claim should succeed
+    client.claim_scholarship(&student, &100);
+    
+    // Second claim should succeed (within limit of 3 per hour)
+    client.claim_scholarship(&student, &100);
+    
+    // Third claim should succeed (within limit of 3 per hour)
+    client.claim_scholarship(&student, &100);
+    
+    // Fourth claim should fail (exceeds rate limit)
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship"),
+        (&student, 100i128),
+    );
+    assert!(result.is_err());
+    
+    // Check that the error is rate limit exceeded
+    let error = result.unwrap_err();
+    assert_eq!(error.error().contract_code(), RateLimitError::RateLimitExceeded as u32);
+}
+
+#[test]
+fn test_claim_scholarship_private_rate_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy a token for testing
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&admin, &10000);
+
+    // Deploy the scholarship contract
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize the contract
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund the contract
+    token_client.mint(&contract_id, &1000);
+
+    // Create a scholarship for the student
+    client.create_scholarship(&student, &token_address.address(), &500);
+
+    // Set initial time
+    env.ledger().set_timestamp(1000);
+
+    // Create mock ZK proof
+    let nullifier = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let commitment = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+    let proof = soroban_sdk::Bytes::from_slice(&env, b"mock_proof");
+    let public_signals = soroban_sdk::Vec::new(&env);
+    
+    let zk_proof = ZKClaimProof {
+        nullifier: nullifier.clone(),
+        commitment: commitment.clone(),
+        proof: proof.clone(),
+        public_signals: public_signals.clone(),
+    };
+
+    // Store commitment to allow private claim
+    env.storage().persistent().set(&DataKey::Commitment(commitment), &true);
+
+    // First private claim should succeed
+    client.claim_scholarship_private(&student, &100, &zk_proof);
+    
+    // Second private claim should succeed (within limit of 2 per hour)
+    let zk_proof2 = ZKClaimProof {
+        nullifier: soroban_sdk::BytesN::from_array(&env, &[3u8; 32]),
+        commitment: soroban_sdk::BytesN::from_array(&env, &[4u8; 32]),
+        proof: soroban_sdk::Bytes::from_slice(&env, b"mock_proof2"),
+        public_signals: soroban_sdk::Vec::new(&env),
+    };
+    
+    // Store second commitment
+    env.storage().persistent().set(&DataKey::Commitment(zk_proof2.commitment.clone()), &true);
+    client.claim_scholarship_private(&student, &100, &zk_proof2);
+    
+    // Third private claim should fail (exceeds rate limit of 2 per hour)
+    let zk_proof3 = ZKClaimProof {
+        nullifier: soroban_sdk::BytesN::from_array(&env, &[5u8; 32]),
+        commitment: soroban_sdk::BytesN::from_array(&env, &[6u8; 32]),
+        proof: soroban_sdk::Bytes::from_slice(&env, b"mock_proof3"),
+        public_signals: soroban_sdk::Vec::new(&env),
+    };
+    
+    // Store third commitment
+    env.storage().persistent().set(&DataKey::Commitment(zk_proof3.commitment.clone()), &true);
+    
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship_private"),
+        (&student, 100i128, zk_proof3),
+    );
+    assert!(result.is_err());
+    
+    // Check that the error is rate limit exceeded
+    let error = result.unwrap_err();
+    assert_eq!(error.error().contract_code(), RateLimitError::RateLimitExceeded as u32);
+}
+
+#[test]
+fn test_claim_final_release_rate_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy a token for testing
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&admin, &10000);
+
+    // Deploy the scholarship contract
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize the contract
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund the contract
+    token_client.mint(&contract_id, &1000);
+
+    // Create a scholarship with total grant for final release testing
+    client.create_scholarship(&student, &token_address.address(), &500);
+    
+    // Set up final release conditions
+    let vote = CommunityVote {
+        student: student.clone(),
+        funder: admin.clone(),
+        yes_votes: 5, // Meets threshold
+        voters: soroban_sdk::Vec::new(&env),
+        is_passed: true,
+        created_at: env.ledger().timestamp(),
+        passed_at: env.ledger().timestamp(),
+    };
+    env.storage().persistent().set(&DataKey::CommunityVote(student.clone()), &vote);
+
+    // Set initial time
+    env.ledger().set_timestamp(1000);
+
+    // First final release claim should succeed
+    client.claim_final_release(&student);
+    
+    // Second final release claim should fail (rate limit of 1 per day)
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_final_release"),
+        (&student,),
+    );
+    assert!(result.is_err());
+    
+    // Check that the error is rate limit exceeded
+    let error = result.unwrap_err();
+    assert_eq!(error.error().contract_code(), RateLimitError::RateLimitExceeded as u32);
+}
+
+#[test]
+fn test_rate_limit_window_reset() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy a token for testing
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&admin, &10000);
+
+    // Deploy the scholarship contract
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize the contract
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund the contract
+    token_client.mint(&contract_id, &1000);
+
+    // Create a scholarship for the student
+    client.create_scholarship(&student, &token_address.address(), &500);
+
+    // Set initial time
+    env.ledger().set_timestamp(1000);
+
+    // Make 3 claims (reaching the limit)
+    client.claim_scholarship(&student, &100);
+    client.claim_scholarship(&student, &100);
+    client.claim_scholarship(&student, &100);
+    
+    // Fourth claim should fail
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship"),
+        (&student, 100i128),
+    );
+    assert!(result.is_err());
+    
+    // Advance time by more than the rate limit window (1 hour + 1 second)
+    env.ledger().set_timestamp(1000 + CLAIM_RATE_LIMIT_WINDOW + 1);
+    
+    // Now a claim should succeed again (window reset)
+    client.claim_scholarship(&student, &100);
+}
+
+#[test]
+fn test_reset_student_rate_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy a token for testing
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&admin, &10000);
+
+    // Deploy the scholarship contract
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize the contract
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund the contract
+    token_client.mint(&contract_id, &1000);
+
+    // Create a scholarship for the student
+    client.create_scholarship(&student, &token_address.address(), &500);
+
+    // Set initial time
+    env.ledger().set_timestamp(1000);
+
+    // Make 3 claims (reaching the limit)
+    client.claim_scholarship(&student, &100);
+    client.claim_scholarship(&student, &100);
+    client.claim_scholarship(&student, &100);
+    
+    // Fourth claim should fail
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship"),
+        (&student, 100i128),
+    );
+    assert!(result.is_err());
+    
+    // Admin resets rate limits
+    client.reset_student_rate_limits(&admin, &student);
+    
+    // Now a claim should succeed again (rate limits reset)
+    client.claim_scholarship(&student, &100);
+    
+    // Non-admin should not be able to reset rate limits
+    let unauthorized = Address::generate(&env);
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "reset_student_rate_limits"),
+        (&unauthorized, &student),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_different_students_independent_rate_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student1 = Address::generate(&env);
+    let student2 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy a token for testing
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&admin, &10000);
+
+    // Deploy the scholarship contract
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize the contract
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund the contract
+    token_client.mint(&contract_id, &2000);
+
+    // Create scholarships for both students
+    client.create_scholarship(&student1, &token_address.address(), &500);
+    client.create_scholarship(&student2, &token_address.address(), &500);
+
+    // Set initial time
+    env.ledger().set_timestamp(1000);
+
+    // Student1 makes 3 claims (reaching their limit)
+    client.claim_scholarship(&student1, &100);
+    client.claim_scholarship(&student1, &100);
+    client.claim_scholarship(&student1, &100);
+    
+    // Student1's fourth claim should fail
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship"),
+        (&student1, 100i128),
+    );
+    assert!(result.is_err());
+    
+    // Student2 should still be able to make claims (independent rate limits)
+    client.claim_scholarship(&student2, &100);
+    client.claim_scholarship(&student2, &100);
+    client.claim_scholarship(&student2, &100);
+    
+    // Student2's fourth claim should also fail
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship"),
+        (&student2, 100i128),
+    );
+    assert!(result.is_err());
+}

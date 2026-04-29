@@ -94,6 +94,14 @@ const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 /// Duration of a university-triggered security hold (7 days).
 const SECURITY_HOLD_DURATION: u64 = 7 * 24 * 60 * 60;
 
+// Rate limiting constants for student claim functions
+const CLAIM_RATE_LIMIT_WINDOW: u64 = 3600; // 1 hour window in seconds
+const CLAIM_RATE_LIMIT_MAX_ATTEMPTS: u32 = 3; // Max 3 claims per hour
+const PRIVATE_CLAIM_RATE_LIMIT_WINDOW: u64 = 3600; // 1 hour window for private claims
+const PRIVATE_CLAIM_RATE_LIMIT_MAX_ATTEMPTS: u32 = 2; // Max 2 private claims per hour (more restrictive)
+const FINAL_RELEASE_RATE_LIMIT_WINDOW: u64 = 86400; // 24 hours for final release
+const FINAL_RELEASE_RATE_LIMIT_MAX_ATTEMPTS: u32 = 1; // Only 1 final release attempt per day
+
 mod issue_features;
 mod safe_math;
 
@@ -695,6 +703,10 @@ pub enum DataKey {
     CommitteeApprovalBitmap(Address, u64, u64),
     GrantCommitteeNonce(Address, u64),
     MilestoneReviewSession(Address, u64, u64),
+    // Rate limiting keys for student claim functions
+    ClaimRateLimit(Address), // student -> RateLimitInfo
+    PrivateClaimRateLimit(Address), // student -> RateLimitInfo  
+    FinalReleaseRateLimit(Address), // student -> RateLimitInfo
 }
 
 #[contracttype]
@@ -704,6 +716,15 @@ pub struct YieldAllocation {
     pub amm: Address,
     pub total_weight: i128,
     pub last_updated: u64,
+}
+
+/// Rate limiting information for student claim functions
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RateLimitInfo {
+    pub last_claim_time: u64,      // Timestamp of last claim attempt
+    pub claim_count: u32,          // Number of claims in current window
+    pub window_start: u64,         // Start time of current window
 }
 
 /// Issue #233: aggregate matching attribution per institution (school).
@@ -1002,6 +1023,15 @@ pub enum PrivacyError {
     NullifierAlreadyUsed = 10,
     InvalidCommitment = 11,
     ProofVerificationFailed = 12,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+/// Errors related to rate limiting on claim functions.
+pub enum RateLimitError {
+    RateLimitExceeded = 30,
+    TooManyClaims = 31,
 }
 
 #[contracterror]
@@ -2524,6 +2554,17 @@ impl ScholarContract {
     pub fn claim_final_release(env: Env, student: Address) {
         student.require_auth();
 
+        // Check rate limits before processing final release claim (most restrictive)
+        if let Err(rate_error) = Self::check_rate_limit(
+            &env,
+            &student,
+            DataKey::FinalReleaseRateLimit(student.clone()),
+            FINAL_RELEASE_RATE_LIMIT_WINDOW,
+            FINAL_RELEASE_RATE_LIMIT_MAX_ATTEMPTS,
+        ) {
+            env.panic_with_error(rate_error);
+        }
+
         let vote: CommunityVote = env
             .storage()
             .persistent()
@@ -3070,8 +3111,95 @@ impl ScholarContract {
             .remove(&DataKey::UnlockTime(student.clone()));
     }
 
+    /// Rate limiting helper function to check if a student can make a claim
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `student` - The student address attempting to claim
+    /// * `rate_limit_key` - The storage key for rate limit data
+    /// * `window_seconds` - The time window for rate limiting (in seconds)
+    /// * `max_attempts` - Maximum allowed attempts in the window
+    /// 
+    /// # Returns
+    /// * `Ok(())` if the claim is allowed
+    /// * `Err(RateLimitError)` if the rate limit is exceeded
+    fn check_rate_limit(
+        env: &Env,
+        student: &Address,
+        rate_limit_key: DataKey,
+        window_seconds: u64,
+        max_attempts: u32,
+    ) -> Result<(), RateLimitError> {
+        let current_time = env.ledger().timestamp();
+        
+        // Try to get existing rate limit info
+        if let Some(mut rate_info) = env.storage().instance().get::<DataKey, RateLimitInfo>(&rate_limit_key) {
+            // Check if the current window has expired
+            if current_time >= rate_info.window_start + window_seconds {
+                // Window expired, reset counters
+                rate_info.window_start = current_time;
+                rate_info.claim_count = 1;
+                rate_info.last_claim_time = current_time;
+            } else {
+                // Still within the current window
+                if rate_info.claim_count >= max_attempts {
+                    return Err(RateLimitError::RateLimitExceeded);
+                }
+                rate_info.claim_count += 1;
+                rate_info.last_claim_time = current_time;
+            }
+            
+            // Update the rate limit info
+            env.storage().instance().set(&rate_limit_key, &rate_info);
+        } else {
+            // No existing rate limit info, create new entry
+            let rate_info = RateLimitInfo {
+                last_claim_time: current_time,
+                claim_count: 1,
+                window_start: current_time,
+            };
+            env.storage().instance().set(&rate_limit_key, &rate_info);
+        }
+        
+        Ok(())
+    }
+
+    /// Admin function to reset rate limits for a student (emergency use)
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - The admin address (must be contract admin)
+    /// * `student` - The student address to reset rate limits for
+    pub fn reset_student_rate_limits(env: Env, admin: Address, student: Address) {
+        // Verify admin authorization
+        let contract_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != contract_admin {
+            env.panic_with_error(ScholarErr::Unauthorized);
+        }
+        
+        // Remove all rate limit entries for the student
+        env.storage().instance().remove(&DataKey::ClaimRateLimit(student.clone()));
+        env.storage().instance().remove(&DataKey::PrivateClaimRateLimit(student.clone()));
+        env.storage().instance().remove(&DataKey::FinalReleaseRateLimit(student));
+    }
+
     pub fn claim_scholarship(env: Env, student: Address, amount: i128) {
         student.require_auth();
+
+        // Check rate limits before processing claim
+        if let Err(rate_error) = Self::check_rate_limit(
+            &env,
+            &student,
+            DataKey::ClaimRateLimit(student.clone()),
+            CLAIM_RATE_LIMIT_WINDOW,
+            CLAIM_RATE_LIMIT_MAX_ATTEMPTS,
+        ) {
+            env.panic_with_error(rate_error);
+        }
 
         let payout_address: Address = env
             .storage()
@@ -3109,6 +3237,17 @@ impl ScholarContract {
         zk_proof: ZKClaimProof,
     ) {
         student.require_auth();
+
+        // Check rate limits before processing claim (more restrictive for private claims)
+        if let Err(rate_error) = Self::check_rate_limit(
+            &env,
+            &student,
+            DataKey::PrivateClaimRateLimit(student.clone()),
+            PRIVATE_CLAIM_RATE_LIMIT_WINDOW,
+            PRIVATE_CLAIM_RATE_LIMIT_MAX_ATTEMPTS,
+        ) {
+            env.panic_with_error(rate_error);
+        }
 
         // 1. Verify Nullifier has not been used before (Prevent double-claiming)
         let nullifier_key = DataKey::Nullifier(zk_proof.nullifier.clone());
