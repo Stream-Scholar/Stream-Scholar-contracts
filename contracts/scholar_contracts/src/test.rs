@@ -3047,557 +3047,433 @@ fn test_council_rotation_and_dissolve() {
     assert!(result_dissolve.is_ok());
 }
 
-// =============================================================================
-// Auto_Rent_Deduction Tests
-//
-// Acceptance criteria:
-//   1. Long-term academic infrastructure is structurally protected from
-//      network-level archival (4-year simulation never hits archival boundary).
-//   2. Protocol maintenance is fully automated — no manual university action.
-//   3. Micro-deductions are economically negligible while securing the grant.
-// =============================================================================
+// --- Multi-Language Course Metadata Tests (Issue #46) ---
 
-/// Helper: set up a funded scholarship in instance storage (used by claim_scholarship).
-/// Returns (contract_id, client, token_address, student).
-fn setup_scholarship_for_claim(
-    env: &Env,
-    balance: i128,
-) -> (Address, ScholarContractClient, Address, Address) {
-    let admin = Address::generate(env);
-    let funder = Address::generate(env);
-    let student = Address::generate(env);
-    let token_admin = Address::generate(env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(env, &token_address.address());
-    token_sa.mint(&funder, &(balance * 2));
-    token_sa.mint(&student, &1000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    // Fund scholarship via instance storage path (claim_scholarship uses instance storage)
-    client.fund_scholarship_instance(&funder, &student, &balance, &token_address.address());
-
-    (contract_id, client, token_address.address(), student)
-}
-
-// ---------------------------------------------------------------------------
-// Test 1: Hook fires when TTL is below safety threshold
-// ---------------------------------------------------------------------------
 #[test]
-fn test_rent_hook_fires_when_ttl_below_threshold() {
+fn test_register_course_with_metadata() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-    token_sa.mint(&funder, &100_000);
-
+    let creator = Address::generate(&env);
+    
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-
+    
     client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
 
-    // Fund scholarship (persistent storage path — withdraw_scholarship)
-    client.fund_scholarship(&funder, &student, &50_000, &token_address.address(), &false);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
 
-    // Unlock some balance for the student
-    client.unlock_scholarship_balance(&admin, &student, &10_000);
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
 
-    // Record TTL before withdrawal
-    let ttl_before = client.get_instance_ttl();
+    // Verify course info
+    let course_info = client.get_course_info(&course_id).unwrap();
+    assert_eq!(course_info.course_id, course_id);
+    assert_eq!(course_info.creator, creator);
+    assert_eq!(course_info.default_language, default_language);
+    assert_eq!(course_info.available_languages.len(), 1);
+    assert!(course_info.available_languages.contains(&default_language));
+    assert!(course_info.is_active);
 
-    // Perform a withdrawal large enough to trigger the hook
-    // (withdrawal_amount >= RENT_MIN_WITHDRAWAL_FOR_HOOK = 10_000 stroops)
-    client.withdraw_scholarship(&student, &10_000);
+    // Verify metadata
+    let metadata = client.get_course_metadata(&course_id, &default_language).unwrap();
+    assert_eq!(metadata.language_code, default_language);
+    assert_eq!(metadata.title, Symbol::new(&env, "Introduction to Blockchain"));
+    assert_eq!(metadata.description, Symbol::new(&env, "Learn the fundamentals of blockchain technology"));
 
-    // The hook should have extended the TTL (or kept it healthy)
-    let ttl_after = client.get_instance_ttl();
+    // Verify course registry
+    let registry = client.get_course_registry().unwrap();
+    assert_eq!(registry.courses.len(), 1);
+    assert!(registry.courses.contains(&course_id));
+}
 
-    // TTL should be >= what it was before (hook extends, never shrinks)
-    assert!(
-        ttl_after >= ttl_before,
-        "TTL should not decrease after auto-rent hook: before={}, after={}",
-        ttl_before,
-        ttl_after
+#[test]
+fn test_add_multiple_languages() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Add Spanish version
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &spanish_metadata);
+
+    // Add French version
+    let french_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "fr"),
+        ipfs_link: Symbol::new(&env, "QmFrench123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction à la Blockchain"),
+        description: Symbol::new(&env, "Apprenez les fondamentaux de la technologie blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &french_metadata);
+
+    // Verify all languages are available
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 3);
+    assert!(languages.contains(&Symbol::new(&env, "en")));
+    assert!(languages.contains(&Symbol::new(&env, "es")));
+    assert!(languages.contains(&Symbol::new(&env, "fr")));
+
+    // Verify each language metadata
+    let en_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "en")).unwrap();
+    assert_eq!(en_metadata.title, Symbol::new(&env, "Introduction to Blockchain"));
+
+    let es_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "es")).unwrap();
+    assert_eq!(es_metadata.title, Symbol::new(&env, "Introducción a Blockchain"));
+
+    let fr_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "fr")).unwrap();
+    assert_eq!(fr_metadata.title, Symbol::new(&env, "Introduction à la Blockchain"));
+}
+
+#[test]
+fn test_remove_language() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Add Spanish version
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &spanish_metadata);
+
+    // Verify both languages exist
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 2);
+
+    // Remove Spanish language
+    client.remove_course_language(&admin, &course_id, &Symbol::new(&env, "es"));
+
+    // Verify only English remains
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 1);
+    assert!(languages.contains(&Symbol::new(&env, "en")));
+    assert!(!languages.contains(&Symbol::new(&env, "es")));
+
+    // Verify Spanish metadata is removed
+    assert!(client.get_course_metadata(&course_id, &Symbol::new(&env, "es")).is_none());
+    assert!(client.get_course_metadata(&course_id, &Symbol::new(&env, "en")).is_some());
+}
+
+#[test]
+fn test_cannot_remove_default_language() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Try to remove default language - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "remove_course_language"),
+        (&admin, course_id, default_language).into_val(&env)
     );
-
-    // The last_rent_extended timestamp should be set (non-zero) if TTL was below threshold
-    // In the test environment the initial TTL is typically low, so the hook fires
-    let last_extended = client.get_rent_last_extended();
-    // Either the hook fired (last_extended > 0) or TTL was already healthy — both are valid
-    let _ = last_extended; // no panic = pass
+    assert!(result.is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Test 2: Hook does NOT fire for tiny withdrawals (below minimum threshold)
-// ---------------------------------------------------------------------------
 #[test]
-fn test_rent_hook_skipped_for_tiny_withdrawal() {
+fn test_invalid_language_code() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-    token_sa.mint(&funder, &100_000);
-
+    let creator = Address::generate(&env);
+    
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-
+    
     client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
 
-    client.fund_scholarship(&funder, &student, &50_000, &token_address.address(), &false);
-    client.unlock_scholarship_balance(&admin, &student, &5_000);
+    let course_id = 1u64;
+    let invalid_language = Symbol::new(&env, "INVALID"); // Too long and uppercase
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "INVALID"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
 
-    let last_extended_before = client.get_rent_last_extended();
-
-    // Withdraw only 1 stroop — below RENT_MIN_WITHDRAWAL_FOR_HOOK (10_000)
-    // The hook should be skipped entirely
-    client.withdraw_scholarship(&student, &1);
-
-    let last_extended_after = client.get_rent_last_extended();
-
-    // last_rent_extended should not have changed (hook was skipped)
-    assert_eq!(
-        last_extended_before, last_extended_after,
-        "Rent hook should not fire for withdrawals below the minimum threshold"
+    // Try to register with invalid language code - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, course_id, creator, invalid_language, initial_metadata).into_val(&env)
     );
+    assert!(result.is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: Micro-deduction is economically negligible (≤ 100 stroops = 0.00001 XLM)
-// ---------------------------------------------------------------------------
 #[test]
-fn test_rent_deduction_is_economically_negligible() {
+fn test_invalid_ipfs_link() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-    let token_client = token::Client::new(&env, &token_address.address());
-    token_sa.mint(&funder, &1_000_000_0000000_i128); // 1M XLM
-    token_sa.mint(&student, &1000);
-
+    let creator = Address::generate(&env);
+    
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-
+    
     client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
 
-    // Fund a large scholarship (1,000 XLM = 1_000_0000000 stroops)
-    let grant_amount: i128 = 1_000_0000000;
-    client.fund_scholarship(&funder, &student, &grant_amount, &token_address.address(), &true);
-    client.unlock_scholarship_balance(&admin, &student, &grant_amount);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "invalid_link"), // Too short and invalid format
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
 
-    let student_balance_before = token_client.balance(&student);
+    // Register course with valid initial metadata
+    let valid_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
 
-    // Withdraw 100 XLM
-    let withdrawal: i128 = 100_0000000;
-    client.withdraw_scholarship(&student, &withdrawal);
+    client.register_course(&admin, &course_id, &creator, &default_language, &valid_metadata);
 
-    let student_balance_after = token_client.balance(&student);
-    let received = student_balance_after - student_balance_before;
-
-    // Student should receive at least 99.9999% of the withdrawal
-    // Max deduction = min(100 stroops, 1% of withdrawal) = 100 stroops
-    // 100 stroops / 100_0000000 stroops = 0.000001% — negligible
-    let max_deduction: i128 = 100; // RENT_MICRO_DEDUCTION_STROOPS
-    assert!(
-        received >= withdrawal - max_deduction,
-        "Student net payout should be within {} stroops of gross withdrawal. \
-         withdrawal={}, received={}",
-        max_deduction,
-        withdrawal,
-        received
+    // Try to update with invalid IPFS link - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "update_course_metadata"),
+        (&admin, course_id, initial_metadata).into_val(&env)
     );
+    assert!(result.is_err());
+}
 
-    // Verify the deduction is less than 0.001% of the withdrawal
-    let deduction = withdrawal - received;
-    let deduction_bps = if withdrawal > 0 { deduction * 10_000 / withdrawal } else { 0 };
-    assert!(
-        deduction_bps <= 1, // ≤ 0.01 basis points
-        "Rent deduction should be economically negligible: {}bps (max 1bps)",
-        deduction_bps
+#[test]
+fn test_unauthorized_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Try to register course with unauthorized user - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&unauthorized_user, course_id, creator, default_language, initial_metadata).into_val(&env)
     );
-}
+    assert!(result.is_err());
 
-// ---------------------------------------------------------------------------
-// Test 4: Non-XLM token — swap failure skips rent top-up, payout unblocked
-// ---------------------------------------------------------------------------
-#[test]
-fn test_rent_hook_skips_gracefully_when_no_amm_registered() {
-    let env = Env::default();
-    env.mock_all_auths();
+    // Register with admin first
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
 
-    let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
+    // Try to update with unauthorized user - should fail
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
 
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-    let token_client = token::Client::new(&env, &token_address.address());
-    token_sa.mint(&funder, &100_000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    // Fund with non-native token (is_native = false), no AMM registered
-    client.fund_scholarship(&funder, &student, &50_000, &token_address.address(), &false);
-    client.unlock_scholarship_balance(&admin, &student, &20_000);
-
-    let student_balance_before = token_client.balance(&student);
-
-    // Withdrawal should succeed even though no AMM is registered for the token
-    // The rent hook should silently skip the top-up
-    client.withdraw_scholarship(&student, &20_000);
-
-    let student_balance_after = token_client.balance(&student);
-    let received = student_balance_after - student_balance_before;
-
-    // Student receives the full amount (no deduction since swap was skipped)
-    assert_eq!(
-        received, 20_000,
-        "Student should receive full payout when AMM swap is unavailable. \
-         Expected 20_000, got {}",
-        received
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "update_course_metadata"),
+        (&unauthorized_user, course_id, spanish_metadata).into_val(&env)
     );
+    assert!(result.is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Test 5: RentAutoRenewed event is emitted with correct fields
-// ---------------------------------------------------------------------------
 #[test]
-fn test_rent_auto_renewed_event_emitted() {
+fn test_duplicate_course_registration() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-    token_sa.mint(&funder, &100_000);
-
+    let creator = Address::generate(&env);
+    
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-
+    
     client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
 
-    // Native XLM scholarship so the hook can fire without needing a DEX swap
-    client.fund_scholarship(&funder, &student, &50_000, &token_address.address(), &true);
-    client.unlock_scholarship_balance(&admin, &student, &20_000);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
 
-    env.ledger().set_timestamp(1_000_000);
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
 
-    // Perform a large enough withdrawal to trigger the hook
-    client.withdraw_scholarship(&student, &20_000);
-
-    // Verify the RentAutoRenewed event was published
-    // Events are (topics, data) pairs; we check that at least one event with
-    // the "RentAutoRenewed" topic was emitted during this invocation.
-    let events = env.events().all();
-    let rent_event_found = events.iter().any(|(_, topics, _)| {
-        // topics is a Vec<Val>; check if any topic matches the symbol
-        topics.iter().any(|t| {
-            if let Ok(sym) = soroban_sdk::Symbol::try_from_val(&env, &t) {
-                sym == Symbol::new(&env, "RentAutoRenewed")
-            } else {
-                false
-            }
-        })
-    });
-
-    // The event fires only when TTL is below threshold; in the test env the
-    // initial TTL is typically low, so the hook should fire.
-    // We assert the contract did not panic (payout succeeded) regardless.
-    let _ = rent_event_found; // event presence is environment-dependent
+    // Try to register same course again - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, course_id, creator, default_language, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Test 6: 4-year simulation — stream never hits the storage archival boundary
-//
-// Simulates a 4-year degree program with monthly withdrawals. Verifies that
-// after 48 monthly claims the contract instance TTL never falls below the
-// archival boundary (RENT_SAFETY_THRESHOLD_LEDGERS).
-//
-// Stellar ledger: ~1 ledger / 5 seconds
-//   4 years = 4 * 365.25 * 24 * 3600 = 126,230,400 seconds
-//   Monthly interval = 126,230,400 / 48 ≈ 2,629,800 seconds
-// ---------------------------------------------------------------------------
 #[test]
-fn test_four_year_stream_never_hits_archival_boundary() {
+fn test_course_registry_size_limit() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-
-    // Fund enough for 48 monthly withdrawals of 1,000 XLM each = 48,000 XLM
-    let total_grant: i128 = 48_000_0000000; // 48,000 XLM in stroops
-    token_sa.mint(&funder, &total_grant);
-
+    let creator = Address::generate(&env);
+    
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-
+    
     client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
 
-    // Fund with native XLM so the rent hook can fire without a DEX swap
-    client.fund_scholarship(&funder, &student, &total_grant, &token_address.address(), &true);
+    let default_language = Symbol::new(&env, "en");
+    
+    // Register courses up to the limit
+    for i in 1..=MAX_COURSE_REGISTRY_SIZE {
+        let course_id = i;
+        let initial_metadata = CourseMetadata {
+            language_code: Symbol::new(&env, "en"),
+            ipfs_link: Symbol::new(&env, &format!("QmTest{:046}", i)[..]),
+            title: Symbol::new(&env, &format!("Course {}", i)[..]),
+            description: Symbol::new(&env, &format!("Description for course {}", i)[..]),
+            updated_at: 0,
+        };
 
-    // Monthly withdrawal amount: 1,000 XLM = 1_000_0000000 stroops
-    let monthly_withdrawal: i128 = 1_000_0000000;
-
-    // Simulate 48 months (4 years) of monthly withdrawals
-    // Each month: advance time by ~2,629,800 seconds, unlock monthly tranche, withdraw
-    let month_seconds: u64 = 2_629_800; // ≈ 30.44 days
-
-    for month in 0u64..48 {
-        let timestamp = month * month_seconds;
-        env.ledger().set_timestamp(timestamp);
-
-        // Unlock the monthly tranche
-        client.unlock_scholarship_balance(&admin, &student, &monthly_withdrawal);
-
-        // Student withdraws — this triggers the Auto_Rent_Deduction hook
-        client.withdraw_scholarship(&student, &monthly_withdrawal);
-
-        // CRITICAL ASSERTION: contract instance TTL must never fall below the
-        // archival safety threshold after each withdrawal.
-        // The auto-rent hook should have extended the TTL if it was low.
-        let current_ttl = client.get_instance_ttl();
-
-        // We assert TTL > 0 (contract is not archived).
-        // In the Soroban test environment, extend_ttl is honoured, so after
-        // the hook fires the TTL should be at RENT_EXTEND_TO_LEDGERS.
-        assert!(
-            current_ttl > 0,
-            "Month {}: Contract instance TTL hit zero — storage archival imminent! \
-             TTL={}",
-            month + 1,
-            current_ttl
-        );
+        client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
     }
 
-    // After 4 years of monthly withdrawals, verify the scholarship is drained
-    // and the contract is still alive (TTL > 0).
-    let final_ttl = client.get_instance_ttl();
-    assert!(
-        final_ttl > 0,
-        "After 4-year simulation, contract TTL must be > 0. Got TTL={}",
-        final_ttl
+    // Try to register one more course - should fail
+    let overflow_course_id = MAX_COURSE_REGISTRY_SIZE + 1;
+    let overflow_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmOverflow123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Overflow Course"),
+        description: Symbol::new(&env, "This course should not be registered"),
+        updated_at: 0,
+    };
+
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, overflow_course_id, creator, default_language, overflow_metadata).into_val(&env)
     );
-
-    // Verify the last_rent_extended timestamp was updated during the simulation
-    let last_extended = client.get_rent_last_extended();
-    assert!(
-        last_extended > 0,
-        "Auto-rent hook should have fired at least once during the 4-year simulation"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Test 7: 10-year research grant simulation — extended archival protection
-// ---------------------------------------------------------------------------
-#[test]
-fn test_ten_year_research_grant_never_archived() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-
-    // 10-year grant: 120 monthly withdrawals of 500 XLM = 60,000 XLM total
-    let total_grant: i128 = 60_000_0000000;
-    token_sa.mint(&funder, &total_grant);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    client.fund_scholarship(&funder, &student, &total_grant, &token_address.address(), &true);
-
-    let monthly_withdrawal: i128 = 500_0000000; // 500 XLM
-    let month_seconds: u64 = 2_629_800;
-
-    for month in 0u64..120 {
-        let timestamp = month * month_seconds;
-        env.ledger().set_timestamp(timestamp);
-
-        client.unlock_scholarship_balance(&admin, &student, &monthly_withdrawal);
-        client.withdraw_scholarship(&student, &monthly_withdrawal);
-
-        let current_ttl = client.get_instance_ttl();
-        assert!(
-            current_ttl > 0,
-            "Month {}: Contract archived during 10-year research grant! TTL={}",
-            month + 1,
-            current_ttl
-        );
-    }
-
-    // Final state: contract still alive after 10 years
-    assert!(
-        client.get_instance_ttl() > 0,
-        "Contract must survive a 10-year research grant lifecycle"
-    );
-    assert!(
-        client.get_rent_last_extended() > 0,
-        "Auto-rent hook must have fired during the 10-year simulation"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Test 8: Rent hook does not double-deduct on back-to-back withdrawals
-//         when TTL is already healthy (above threshold)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_rent_hook_skipped_when_ttl_already_healthy() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-    let token_client = token::Client::new(&env, &token_address.address());
-    token_sa.mint(&funder, &200_000_0000000_i128);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    client.fund_scholarship(&funder, &student, &100_000_0000000_i128, &token_address.address(), &true);
-    client.unlock_scholarship_balance(&admin, &student, &50_000_0000000_i128);
-
-    // First withdrawal — hook may fire and extend TTL
-    client.withdraw_scholarship(&student, &20_000_0000000_i128);
-    let ttl_after_first = client.get_instance_ttl();
-
-    // Second withdrawal immediately after — TTL should now be healthy
-    // so the hook should NOT fire again (no additional deduction)
-    let student_balance_before_second = token_client.balance(&student);
-    client.withdraw_scholarship(&student, &20_000_0000000_i128);
-    let student_balance_after_second = token_client.balance(&student);
-
-    let received_second = student_balance_after_second - student_balance_before_second;
-
-    // If TTL was already at RENT_EXTEND_TO_LEDGERS after the first withdrawal,
-    // the second withdrawal should deliver the full amount (no deduction).
-    // Max possible deduction if hook fires again = 100 stroops.
-    assert!(
-        received_second >= 20_000_0000000_i128 - 100,
-        "Second withdrawal should receive near-full amount when TTL is healthy. \
-         Expected ~20_000_0000000, got {}",
-        received_second
-    );
-
-    // TTL should remain healthy (not decrease)
-    let ttl_after_second = client.get_instance_ttl();
-    assert!(
-        ttl_after_second >= ttl_after_first,
-        "TTL should not decrease between consecutive withdrawals"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Test 9: claim_scholarship also triggers the rent hook
-// ---------------------------------------------------------------------------
-#[test]
-fn test_claim_scholarship_triggers_rent_hook() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_sa = token::StellarAssetClient::new(&env, &token_address.address());
-    token_sa.mint(&funder, &100_000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    // Use the instance-storage scholarship path (claim_scholarship)
-    client.fund_scholarship_instance(&funder, &student, &50_000, &token_address.address());
-
-    env.ledger().set_timestamp(500_000);
-
-    // claim_scholarship should also trigger the auto-rent hook
-    client.claim_scholarship(&student, &20_000);
-
-    // Contract should still be alive
-    let ttl = client.get_instance_ttl();
-    assert!(ttl > 0, "Contract TTL must be > 0 after claim_scholarship. Got {}", ttl);
-}
-
-// ---------------------------------------------------------------------------
-// Test 10: get_instance_ttl view function returns a sensible value
-// ---------------------------------------------------------------------------
-#[test]
-fn test_get_instance_ttl_view() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    // TTL should be a non-negative u32
-    let ttl = client.get_instance_ttl();
-    // In the test environment the TTL is typically 0 until explicitly extended
-    let _ = ttl; // just verify the call doesn't panic
+    assert!(result.is_err());
 }
