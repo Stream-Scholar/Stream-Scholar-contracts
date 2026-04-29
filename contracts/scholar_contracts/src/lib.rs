@@ -110,13 +110,9 @@ const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 /// Duration of a university-triggered security hold (7 days).
 const SECURITY_HOLD_DURATION: u64 = 7 * 24 * 60 * 60;
 
-// Rate limiting constants for student claim functions
-const CLAIM_RATE_LIMIT_WINDOW: u64 = 3600; // 1 hour window in seconds
-const CLAIM_RATE_LIMIT_MAX_ATTEMPTS: u32 = 3; // Max 3 claims per hour
-const PRIVATE_CLAIM_RATE_LIMIT_WINDOW: u64 = 3600; // 1 hour window for private claims
-const PRIVATE_CLAIM_RATE_LIMIT_MAX_ATTEMPTS: u32 = 2; // Max 2 private claims per hour (more restrictive)
-const FINAL_RELEASE_RATE_LIMIT_WINDOW: u64 = 86400; // 24 hours for final release
-const FINAL_RELEASE_RATE_LIMIT_MAX_ATTEMPTS: u32 = 1; // Only 1 final release attempt per day
+// Issue #262: Anti-frontrunning commit-reveal constants
+const COMMIT_MIN_DELAY: u64 = 5;       // minimum ledger seconds before reveal is allowed
+const COMMIT_EXPIRY: u64 = 3600;       // commit expires after 1 hour
 
 mod issue_features;
 mod safe_math;
@@ -207,6 +203,8 @@ pub struct StudentProfile {
 #[derive(Clone)]
 pub struct StudentGPA {
     pub gpa: u64,
+    pub last_updated: u64,
+    pub oracle_verified: bool,
 }
 
 #[contracttype]
@@ -763,10 +761,40 @@ pub enum DataKey {
     CommitteeApprovalBitmap(Address, u64, u64),
     GrantCommitteeNonce(Address, u64),
     MilestoneReviewSession(Address, u64, u64),
-    // Cross-Contract Call Bounds: Gas tracking for scholarship claims
-    GasTrackingRecord(Address, u64), // student, timestamp -> GasTrackingRecord
-    MaxGasPerClaim,                  // Global config for max gas allowed per claim
-    MaxCrossContractCallsPerClaim,   // Global config for max cross-contract calls
+    // Issue #262: Anti-frontrunning commit-reveal for scholarship applications
+    AppCommit(Address),  // student -> ApplicationCommit
+    AppReveal(Address),  // student -> ApplicationReveal
+    // Missing DataKeys for pre-existing functions
+    AcademicOracle,
+    TuitionStipendSplit(Address), // student -> TuitionStipendSplit
+}
+
+// Issue #262: Anti-frontrunning commit-reveal structs
+/// Phase-1 commitment: stores the hash and the ledger time of the commit.
+#[contracttype]
+#[derive(Clone)]
+pub struct ApplicationCommit {
+    pub commit_hash: BytesN<32>,
+    pub committed_at: u64,
+}
+
+/// Phase-2 reveal: the plaintext inputs whose hash must match the commitment.
+#[contracttype]
+#[derive(Clone)]
+pub struct ApplicationReveal {
+    pub scholarship_id: Address,
+    pub amount: i128,
+    pub salt: BytesN<32>,
+}
+
+/// Tuition-stipend split configuration for a student.
+#[contracttype]
+#[derive(Clone)]
+pub struct TuitionStipendSplit {
+    pub university_address: Address,
+    pub student_address: Address,
+    pub university_percentage: u32,
+    pub student_percentage: u32,
 }
 
 #[contracttype]
@@ -1138,6 +1166,11 @@ pub enum ScholarErr {
     OracleDataStale = 3,
     ReplayAttack = 4,
     InvalidOracleSig = 5,
+    // Issue #262: Anti-frontrunning errors
+    CommitNotFound = 6,
+    RevealTooEarly = 7,
+    RevealExpired = 8,
+    CommitHashMismatch = 9,
 }
 
 #[contracterror]

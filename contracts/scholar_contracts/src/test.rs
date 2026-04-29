@@ -800,7 +800,7 @@ fn test_calculate_remaining_airtime() {
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
 
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // 500 balance / 10 base_rate = 50 seconds
     assert_eq!(client.calculate_remaining_airtime(&student), 50);
@@ -862,7 +862,7 @@ fn test_withdrawal_whitelisting() {
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
 
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // Set whitelisted address
     env.ledger().set_timestamp(0);
@@ -2815,6 +2815,17 @@ fn test_refinance_grant_fails_when_kyc_not_verified() {
 //   ✓ Protocol is validated as "Mainnet Ready".
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Mock oracle contract for academic progress verification
+#[contract]
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn check_status(_env: Env, _student: Address, course_id: u64) -> u32 {
+        if course_id == 1 { 1 } else if course_id == 2 { 0 } else { 2 }
+    }
+}
+
 #[test]
 fn test_e2e_oracle_to_yield_full_lifecycle() {
     let env = Env::default();
@@ -2860,7 +2871,7 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     //   university gets 7,000 (transferred immediately)
     //   student scholarship balance = 3,000
     let donor_balance_before = token.balance(&donor);
-    client.fund_scholarship(&donor, &student, &10_000, &token_addr.address());
+    client.fund_scholarship(&donor, &student, &10_000, &token_addr.address(), &false);
 
     assert_eq!(token.balance(&donor), donor_balance_before - 10_000,
         "Donor should have paid 10,000 tokens");
