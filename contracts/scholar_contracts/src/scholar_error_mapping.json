@@ -1,0 +1,419 @@
+{
+  "title": "Stream Scholar Contract Error Codes",
+  "description": "Machine-readable error code mapping for frontend integration. Each error code maps to actionable student guidance.",
+  "version": "1.0.0",
+  "generated": "2026-04-29",
+  "errors": {
+    "authorization": {
+      "0x1000": {
+        "code": "Unauthorized",
+        "name": "Unauthorized",
+        "description": "General unauthorized access attempt",
+        "studentAction": "Please ensure you are logged in with the correct account permissions",
+        "severity": "error"
+      },
+      "0x1001": {
+        "code": "NotPlatformAdmin",
+        "name": "Platform Admin Required",
+        "description": "Action requires platform administrator privileges",
+        "studentAction": "Contact your university administrator or platform support",
+        "severity": "error"
+      },
+      "0x1002": {
+        "code": "NotUniversityAdmin",
+        "name": "University Admin Required", 
+        "description": "Action requires university administrator privileges",
+        "studentAction": "Contact your university registrar or financial aid office",
+        "severity": "error"
+      },
+      "0x1003": {
+        "code": "NotSecurityCouncil",
+        "name": "Security Council Required",
+        "description": "Action requires security council privileges",
+        "studentAction": "This action is restricted to security council members only",
+        "severity": "error"
+      },
+      "0x1004": {
+        "code": "NotCommitteeMember",
+        "name": "Committee Membership Required",
+        "description": "Action requires committee membership privileges",
+        "studentAction": "Only committee members can perform this action",
+        "severity": "error"
+      },
+      "0x1005": {
+        "code": "Sep12VerificationRequired",
+        "name": "SEP-12 Verification Required",
+        "description": "SEP-12 identity verification is required for this action",
+        "studentAction": "Complete your identity verification through the portal",
+        "severity": "warning"
+      }
+    },
+    "scholarship_state": {
+      "0x1100": {
+        "code": "ScholarshipPaused",
+        "name": "Scholarship Paused",
+        "description": "Your scholarship is currently paused",
+        "studentAction": "Check your email for suspension details or contact support",
+        "severity": "warning"
+      },
+      "0x1101": {
+        "code": "ScholarshipDisputed",
+        "name": "Scholarship Under Dispute",
+        "description": "Your scholarship is currently under dispute review",
+        "studentAction": "Await resolution notification or contact dispute resolution team",
+        "severity": "warning"
+      },
+      "0x1102": {
+        "code": "ScholarshipNotFound",
+        "name": "Scholarship Not Found",
+        "description": "No active scholarship found for your account",
+        "studentAction": "Apply for a scholarship or check if you have been awarded one",
+        "severity": "error"
+      },
+      "0x1103": {
+        "code": "FinalReleaseAlreadyClaimed",
+        "name": "Final Release Already Claimed",
+        "description": "You have already claimed your final scholarship release",
+        "studentAction": "No further action needed - funds have been transferred",
+        "severity": "info"
+      },
+      "0x1104": {
+        "code": "FinalReleaseNotLocked",
+        "name": "Final Release Not Locked",
+        "description": "Final release voting cannot be initiated yet",
+        "studentAction": "Continue using your scholarship until final release conditions are met",
+        "severity": "info"
+      },
+      "0x1105": {
+        "code": "FinalReleaseLocked",
+        "name": "Final Release Locked",
+        "description": "Final 10% is locked pending community vote",
+        "studentAction": "Participate in community voting to release final funds",
+        "severity": "warning"
+      }
+    },
+    "financial": {
+      "0x1200": {
+        "code": "InsufficientBalance",
+        "name": "Insufficient Balance",
+        "description": "Not enough funds in your scholarship account",
+        "studentAction": "Wait for next funding cycle or contact your sponsor",
+        "severity": "error"
+      },
+      "0x1201": {
+        "code": "AmountExceedsAvailableBalance",
+        "name": "Amount Exceeds Available Balance",
+        "description": "Withdrawal amount exceeds available unlocked balance",
+        "studentAction": "Request a smaller amount within your available balance",
+        "severity": "error"
+      },
+      "0x1202": {
+        "code": "AmountExceedsUnlockedBalance",
+        "name": "Amount Exceeds Unlocked Balance",
+        "description": "Requested amount exceeds unlocked scholarship balance",
+        "studentAction": "Check your unlocked balance and request a smaller amount",
+        "severity": "error"
+      },
+      "0x1203": {
+        "code": "InvalidAmount",
+        "name": "Invalid Amount",
+        "description": "The specified amount is invalid",
+        "studentAction": "Enter a positive amount within valid range",
+        "severity": "error"
+      },
+      "0x1204": {
+        "code": "ProtocolFeeOverflow",
+        "name": "Protocol Fee Overflow",
+        "description": "Protocol fee calculation overflow detected",
+        "studentAction": "Try a smaller withdrawal amount or contact support",
+        "severity": "error"
+      },
+      "0x1205": {
+        "code": "TaxRateTooHigh",
+        "name": "Tax Rate Too High",
+        "description": "Tax rate exceeds maximum allowed percentage",
+        "studentAction": "Contact administrator to set appropriate tax rate",
+        "severity": "error"
+      },
+      "0x1206": {
+        "code": "NoBalanceToDistribute",
+        "name": "No Balance to Distribute",
+        "description": "No funds available for distribution",
+        "studentAction": "Wait for funds to be added to the distribution pool",
+        "severity": "warning"
+      },
+      "0x1207": {
+        "code": "NativeXLMReserveViolation",
+        "name": "XLM Reserve Violation",
+        "description": "Final balance is less than required XLM gas reserve",
+        "studentAction": "Add more funds to meet minimum reserve requirements",
+        "severity": "error"
+      }
+    },
+    "security_hold": {
+      "0x1300": {
+        "code": "UniversitySecurityHoldActive",
+        "name": "University Security Hold Active",
+        "description": "Your university has placed a security hold on your scholarship",
+        "studentAction": "Contact your university financial aid office for details",
+        "severity": "warning"
+      },
+      "0x1301": {
+        "code": "SecurityHoldAlreadyInactive",
+        "name": "Security Hold Already Inactive",
+        "description": "The security hold is already inactive",
+        "studentAction": "No action needed - hold is already lifted",
+        "severity": "info"
+      },
+      "0x1302": {
+        "code": "SecurityHoldNotFound",
+        "name": "Security Hold Not Found",
+        "description": "No active security hold found",
+        "studentAction": "Contact your university if you believe this is incorrect",
+        "severity": "info"
+      }
+    },
+    "community_voting": {
+      "0x1400": {
+        "code": "VoteAlreadyInitiated",
+        "name": "Vote Already Initiated",
+        "description": "Community vote has already been initiated for this scholarship",
+        "studentAction": "Participate in the existing vote or wait for results",
+        "severity": "info"
+      },
+      "0x1401": {
+        "code": "VoteAlreadyPassed",
+        "name": "Vote Already Passed",
+        "description": "The community vote has already passed",
+        "studentAction": "You can now claim your final release",
+        "severity": "info"
+      },
+      "0x1402": {
+        "code": "VoterAlreadyVoted",
+        "name": "Already Voted",
+        "description": "You have already voted in this election",
+        "studentAction": "Your vote has been recorded - no further action needed",
+        "severity": "info"
+      },
+      "0x1403": {
+        "code": "VoteNotPassed",
+        "name": "Vote Not Passed",
+        "description": "Community vote has not passed yet",
+        "studentAction": "Wait for more votes or campaign for support",
+        "severity": "warning"
+      },
+      "0x1404": {
+        "code": "VoteNotFound",
+        "name": "Vote Not Found",
+        "description": "No active vote found for this scholarship",
+        "studentAction": "Initiate a new vote or check back later",
+        "severity": "info"
+      }
+    },
+    "academic_milestone": {
+      "0x1500": {
+        "code": "MilestoneNotReady",
+        "name": "Milestone Not Ready",
+        "description": "Academic milestone requirements not yet met",
+        "studentAction": "Submit your transcript to the university portal first",
+        "severity": "warning"
+      },
+      "0x1501": {
+        "code": "MilestoneAlreadyClaimed",
+        "name": "Milestone Already Claimed",
+        "description": "This milestone has already been claimed",
+        "studentAction": "Move to the next milestone or check your progress",
+        "severity": "info"
+      },
+      "0x1502": {
+        "code": "GPABelowThreshold",
+        "name": "GPA Below Threshold",
+        "description": "Your GPA is below the required threshold",
+        "studentAction": "Focus on improving your grades or contact academic advisor",
+        "severity": "warning"
+      },
+      "0x1503": {
+        "code": "GPANotSubmitted",
+        "name": "GPA Not Submitted",
+        "description": "Your GPA has not been submitted to the system",
+        "studentAction": "Submit your official transcript to the registrar office",
+        "severity": "warning"
+      },
+      "0x1504": {
+        "code": "TranscriptNotVerified",
+        "name": "Transcript Not Verified",
+        "description": "Your transcript has not been verified by the oracle",
+        "studentAction": "Ensure your transcript is officially submitted and processed",
+        "severity": "warning"
+      }
+    },
+    "configuration": {
+      "0x1600": {
+        "code": "InvalidConfiguration",
+        "name": "Invalid Configuration",
+        "description": "The provided configuration is invalid",
+        "studentAction": "Check your input parameters and try again",
+        "severity": "error"
+      },
+      "0x1601": {
+        "code": "ClawbackPercentageTooHigh",
+        "name": "Clawback Percentage Too High",
+        "description": "Clawback percentage exceeds maximum allowed",
+        "studentAction": "Set a lower clawback percentage within allowed limits",
+        "severity": "error"
+      },
+      "0x1602": {
+        "code": "CommitteeFull",
+        "name": "Committee Full",
+        "description": "The committee has reached maximum capacity",
+        "studentAction": "Contact administrator to expand committee or wait for openings",
+        "severity": "warning"
+      },
+      "0x1603": {
+        "code": "InvalidSlot",
+        "name": "Invalid Slot",
+        "description": "The committee slot number is invalid",
+        "studentAction": "Choose a valid committee slot number",
+        "severity": "error"
+      },
+      "0x1604": {
+        "code": "BadMilestoneCount",
+        "name": "Invalid Milestone Count",
+        "description": "Number of milestones is invalid",
+        "studentAction": "Set a valid milestone count between 1 and 64",
+        "severity": "error"
+      },
+      "0x1605": {
+        "code": "BadMaskLength",
+        "name": "Invalid Mask Length",
+        "description": "Parent mask length does not match milestone count",
+        "studentAction": "Ensure mask length matches the number of milestones",
+        "severity": "error"
+      },
+      "0x1606": {
+        "code": "MilestoneDependencyCycle",
+        "name": "Milestone Dependency Cycle",
+        "description": "Milestone dependencies create a circular reference",
+        "studentAction": "Remove circular dependencies in milestone configuration",
+        "severity": "error"
+      }
+    },
+    "reputation_export": {
+      "0x1700": {
+        "code": "ExportBlockedPendingDiscipline",
+        "name": "Export Blocked - Pending Discipline",
+        "description": "Reputation export blocked due to pending disciplinary action",
+        "studentAction": "Resolve disciplinary issues before exporting reputation",
+        "severity": "warning"
+      },
+      "0x1701": {
+        "code": "ReputationExportReplay",
+        "name": "Replay Attack Detected",
+        "description": "Duplicate reputation export request detected",
+        "studentAction": "Use a new nonce for each export request",
+        "severity": "error"
+      },
+      "0x1702": {
+        "code": "CrossChainDedupCollision",
+        "name": "Cross-Chain Collision",
+        "description": "Cross-chain message hash collision detected",
+        "studentAction": "Wait a moment and try again with a new request",
+        "severity": "error"
+      }
+    },
+    "committee_review": {
+      "0x1800": {
+        "code": "NoActiveCommitteeSession",
+        "name": "No Active Committee Session",
+        "description": "No active committee review session found",
+        "studentAction": "Start a new committee review session",
+        "severity": "warning"
+      },
+      "0x1801": {
+        "code": "CommitteeStillInWindow",
+        "name": "Committee Still in Review Window",
+        "description": "Committee review window has not expired",
+        "studentAction": "Wait for the review window to expire before finalizing",
+        "severity": "warning"
+      },
+      "0x1802": {
+        "code": "AlreadyFinalized",
+        "name": "Already Finalized",
+        "description": "This committee review has already been finalized",
+        "studentAction": "No further action needed - review is complete",
+        "severity": "info"
+      },
+      "0x1803": {
+        "code": "CommitteeSessionNotFound",
+        "name": "Committee Session Not Found",
+        "description": "The specified committee session does not exist",
+        "studentAction": "Verify the session ID or create a new session",
+        "severity": "error"
+      }
+    },
+    "oracle_data": {
+      "0x1900": {
+        "code": "OracleDataStale",
+        "name": "Oracle Data Stale",
+        "description": "Oracle data is too old and considered stale",
+        "studentAction": "Wait for fresh oracle data or contact data provider",
+        "severity": "warning"
+      },
+      "0x1901": {
+        "code": "InvalidOracleSignature",
+        "name": "Invalid Oracle Signature",
+        "description": "Oracle signature verification failed",
+        "studentAction": "Contact oracle provider or try with fresh data",
+        "severity": "error"
+      },
+      "0x1902": {
+        "code": "TimelockNotExpired",
+        "name": "Timelock Not Expired",
+        "description": "Required timelock period has not expired",
+        "studentAction": "Wait for the timelock period to complete",
+        "severity": "warning"
+      },
+      "0x1903": {
+        "code": "ReplayAttack",
+        "name": "Replay Attack Detected",
+        "description": "Duplicate transaction detected",
+        "studentAction": "Use a fresh transaction with new parameters",
+        "severity": "error"
+      }
+    },
+    "system": {
+      "0x1A00": {
+        "code": "LeaderboardEmpty",
+        "name": "Leaderboard Empty",
+        "description": "No students found on the leaderboard",
+        "studentAction": "Participate in activities to appear on the leaderboard",
+        "severity": "info"
+      },
+      "0x1A01": {
+        "code": "ResearchBonusNotInitialized",
+        "name": "Research Bonus Not Initialized",
+        "description": "Research bonus fund has not been initialized",
+        "studentAction": "Contact administrator to initialize the bonus fund",
+        "severity": "warning"
+      },
+      "0x1A02": {
+        "code": "InvalidTimestamp",
+        "name": "Invalid Timestamp",
+        "description": "The provided timestamp is invalid",
+        "studentAction": "Use a valid current timestamp",
+        "severity": "error"
+      },
+      "0x1A03": {
+        "code": "ExecutionDelayNotMet",
+        "name": "Execution Delay Not Met",
+        "description": "Required execution delay period has not passed",
+        "studentAction": "Wait for the delay period to expire before executing",
+        "severity": "warning"
+      }
+    }
+  },
+  "usage_examples": {
+    "frontend_switch": "// Example frontend usage\nswitch (error.code) {\n  case 0x1500:\n    showStudentAction('Submit your transcript to the university portal first');\n    break;\n  case 0x1300:\n    showStudentAction('Contact your university financial aid office for details');\n    break;\n  case 0x1200:\n    showStudentAction('Wait for next funding cycle or contact your sponsor');\n    break;\n  default:\n    showGenericError('Transaction failed. Please try again.');\n}",
+    "error_mapping": "const ERROR_MAPPING = {\n  0x1500: 'Submit your transcript to the university portal first',\n  0x1300: 'Contact your university financial aid office for details',\n  0x1200: 'Wait for next funding cycle or contact your sponsor'\n};\n\nfunction getStudentAction(errorCode) {\n  return ERROR_MAPPING[errorCode] || 'Contact support for assistance';\n}"
+  }
+}

@@ -8,14 +8,14 @@ impl ScholarContract {
             .storage()
             .instance()
             .get(&DataKey::SecurityCouncil)
-            .unwrap_or_else(|| panic!("SecurityCouncil not configured"));
+            .ok_or(ScholarError::NotSecurityCouncil)?;
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic!("Admin not set"));
+            .ok_or(ScholarError::NotPlatformAdmin)?;
         if auth != council && auth != admin {
-            panic!("Unauthorized");
+            return Err(ScholarError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::ReputationFeeSink, &sink);
     }
@@ -26,9 +26,9 @@ impl ScholarContract {
             .storage()
             .instance()
             .get(&DataKey::SecurityCouncil)
-            .expect("SecurityCouncil not configured");
+            .ok_or(ScholarError::NotSecurityCouncil)?;
         if council != sec {
-            panic!("Unauthorized");
+            return Err(ScholarError::NotSecurityCouncil);
         }
         env.storage()
             .persistent()
@@ -48,11 +48,11 @@ impl ScholarContract {
             .get::<_, bool>(&DataKey::ExportDisciplineHold(student.clone()))
             .unwrap_or(false)
         {
-            panic!("ExportBlockedPendingDiscipline");
+            return Err(ScholarError::ExportBlockedPendingDiscipline);
         }
         let nonce_key = DataKey::ReputationExportNonce(student.clone(), client_nonce);
         if env.storage().persistent().has(&nonce_key) {
-            panic!("ReputationExportReplay");
+            return Err(ScholarError::ReputationExportReplay);
         }
         env.storage().persistent().set(&nonce_key, &true);
 
@@ -113,7 +113,7 @@ impl ScholarContract {
         let msg_bn: BytesN<32> = msg_id_h.clone().into();
         let dedup_key = DataKey::ReputationExportDedup(msg_bn.clone());
         if env.storage().persistent().has(&dedup_key) {
-            panic!("CrossChainDedupCollision");
+            return Err(ScholarError::CrossChainDedupCollision);
         }
         env.storage().persistent().set(&dedup_key, &true);
 
@@ -263,16 +263,16 @@ impl ScholarContract {
                 .get::<_, bool>(&DataKey::OracleStatus(authority.clone()))
                 .unwrap_or(false)
         {
-            panic!("Unauthorized");
+            return Err(ScholarError::Unauthorized);
         }
         if cfg.milestone_count == 0 || cfg.milestone_count > MAX_MILESTONE_SLOTS {
-            panic!("BadMilestoneCount");
+            return Err(ScholarError::BadMilestoneCount);
         }
         if cfg.parent_masks.len() != cfg.milestone_count {
-            panic!("BadMaskLen");
+            return Err(ScholarError::BadMaskLength);
         }
         if crate::issue_features::milestone_graph_has_cycle(cfg.milestone_count, &cfg.parent_masks) {
-            panic!("MilestoneDependencyCycle");
+            return Err(ScholarError::MilestoneDependencyCycle);
         }
         env.storage()
             .persistent()
@@ -314,9 +314,9 @@ impl ScholarContract {
             .storage()
             .instance()
             .get(&DataKey::SecurityCouncil)
-            .unwrap_or_else(|| panic!("SecurityCouncil not configured"));
+            .ok_or(ScholarError::NotSecurityCouncil)?;
         if authority != council && !Self::is_admin(&env, &authority) {
-            panic!("Unauthorized");
+            return Err(ScholarError::Unauthorized);
         }
         env.storage()
             .persistent()
@@ -342,7 +342,7 @@ impl ScholarContract {
     ) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Unauthorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         env.storage()
             .persistent()
@@ -352,7 +352,7 @@ impl ScholarContract {
     pub fn register_committee_member(env: Env, admin: Address, committee_id: u64, member: Address) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Unauthorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         let idx: u32 = env
             .storage()
@@ -360,7 +360,7 @@ impl ScholarContract {
             .get(&DataKey::CommitteeNextMemberIdx(committee_id))
             .unwrap_or(0);
         if idx >= 64 {
-            panic!("CommitteeFull");
+            return Err(ScholarError::CommitteeFull);
         }
         env.storage()
             .persistent()
@@ -377,7 +377,7 @@ impl ScholarContract {
     pub fn mark_committee_sep12_verified(env: Env, admin: Address, member: Address, verified: bool) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Unauthorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         env.storage()
             .persistent()
@@ -403,7 +403,7 @@ impl ScholarContract {
             .get(&DataKey::CommitteeMember(cfg.committee_id, signer.clone()))
             .unwrap_or(false);
         if !mem_ok {
-            panic!("NotCommitteeMember");
+            return Err(ScholarError::NotCommitteeMember);
         }
         let sep: bool = env
             .storage()
@@ -411,7 +411,7 @@ impl ScholarContract {
             .get(&DataKey::CommitteeSep12Verified(signer.clone()))
             .unwrap_or(false);
         if !sep {
-            panic!("Sep12Required");
+            return Err(ScholarError::Sep12VerificationRequired);
         }
         let slot: u32 = env
             .storage()
@@ -419,7 +419,7 @@ impl ScholarContract {
             .get(&DataKey::CommitteeMemberSlot(cfg.committee_id, signer.clone()))
             .expect("CommitteeMemberSlot missing");
         if slot >= 64 {
-            panic!("BadSlot");
+            return Err(ScholarError::InvalidSlot);
         }
 
         let mut session: MilestoneReviewSession = env
@@ -435,7 +435,7 @@ impl ScholarContract {
                 finalized: false,
             });
         if session.finalized {
-            panic!("AlreadyFinalized");
+            return Err(ScholarError::AlreadyFinalized);
         }
         let now = env.ledger().timestamp();
         if session.started_at == 0 {
@@ -498,9 +498,9 @@ impl ScholarContract {
             .storage()
             .instance()
             .get(&DataKey::SecurityCouncil)
-            .expect("SecurityCouncil not configured");
+            .ok_or(ScholarError::NotSecurityCouncil)?;
         if council != sec {
-            panic!("Unauthorized");
+            return Err(ScholarError::NotSecurityCouncil);
         }
         let session: MilestoneReviewSession = env
             .storage()
@@ -510,13 +510,13 @@ impl ScholarContract {
                 course_id,
                 milestone_id,
             ))
-            .expect("No session");
+            .ok_or(ScholarError::CommitteeSessionNotFound)?;
         if session.started_at == 0 {
-            panic!("NoActiveCommitteeSession");
+            return Err(ScholarError::NoActiveCommitteeSession);
         }
         if env.ledger().timestamp() < session.started_at.saturating_add(COMMITTEE_REVIEW_TIMEOUT_SECS)
         {
-            panic!("CommitteeStillInWindow");
+            return Err(ScholarError::CommitteeStillInWindow);
         }
         let mut session = session;
         session.finalized = true;

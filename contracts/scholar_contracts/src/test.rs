@@ -1421,7 +1421,6 @@ fn test_zk_verification_key_initialization() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
 fn test_zk_verification_key_unauthorized() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1440,8 +1439,13 @@ fn test_zk_verification_key_unauthorized() {
     }
     let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
 
-    // Try to initialize with unauthorized address
-    client.init_zk_verification_key(&unauthorized, &verification_key);
+    // Try to initialize with unauthorized address should return NotPlatformAdmin error
+    let result = env.try_invoke_contract::<_, ScholarError>(
+        &contract_id,
+        &Symbol::new(&env, "init_zk_verification_key"),
+        (unauthorized, verification_key),
+    );
+    assert_eq!(result.result, Err(ScholarError::NotPlatformAdmin));
 }
 
 #[test]
@@ -2699,7 +2703,6 @@ fn test_rogue_dao_vetoed() {
 }
 
 #[test]
-#[should_panic(expected = "Execution delay not met")]
 fn test_referendum_execution_delay() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2726,8 +2729,13 @@ fn test_referendum_execution_delay() {
     env.ledger().set_timestamp(604801); 
     client.queue_referendum(&proposer, &ref_id);
     
-    // Try to execute immediately, should panic
-    client.execute_referendum(&proposer, &ref_id);
+    // Try to execute immediately, should return ExecutionDelayNotMet error
+    let result = env.try_invoke_contract::<_, ScholarError>(
+        &contract_id,
+        &Symbol::new(&env, "execute_referendum"),
+        (proposer, ref_id),
+    );
+    assert_eq!(result.result, Err(ScholarError::ExecutionDelayNotMet));
 }
 
 #[test]
