@@ -195,7 +195,7 @@ impl ScholarContract {
             .storage()
             .persistent()
             .get::<_, StudentGPA>(&DataKey::StudentGPA(student.clone()))
-            .unwrap_or(StudentGPA { gpa: 0 });
+            .unwrap_or(StudentGPA { gpa: 0, last_updated: 0, oracle_verified: false });
         let mut p = soroban_sdk::Bytes::new(env);
         let tag = b"GPA_DIG";
         for i in 0..tag.len() {
