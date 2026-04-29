@@ -756,6 +756,56 @@ fn test_claim_scholarship_gas_bounds_enforced() {
 }
 
 #[test]
+fn test_private_claim_cross_contract_call_bounds_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.buy_access(&student, &1, &500, &token_address.address());
+
+    let commitment = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    client.store_claim_commitment(&admin, &commitment);
+
+    client.set_claim_gas_bounds(&admin, &2_000_000, &2);
+
+    let nullifier = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+    let proof_data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 128]);
+    let mut public_signals = Vec::new(&env);
+    public_signals.push_back(soroban_sdk::BytesN::from_array(&env, &[3u8; 32]));
+
+    let zk_proof = ZKClaimProof {
+        nullifier: nullifier.clone(),
+        commitment: commitment.clone(),
+        proof: proof_data,
+        public_signals,
+    };
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship_private"),
+        (&student, 100i128, &zk_proof),
+    );
+
+    assert!(
+        result.is_err(),
+        "Private scholarship claim should be rejected when cross-contract call bounds are exceeded"
+    );
+}
+
+#[test]
 fn test_gpa_pause() {
     let env = Env::default();
     env.mock_all_auths();

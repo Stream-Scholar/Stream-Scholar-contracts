@@ -5087,6 +5087,7 @@ impl ScholarContract {
             .instance()
             .set(&DataKey::HeartbeatInterval, &heartbeat_interval);
         env.storage().instance().set(&DataKey::IsInitialized, &true);
+        Self::initialize_gas_bounds(&env);
     }
 
     #[cfg(test)]
