@@ -118,6 +118,9 @@ mod issue_features;
 mod safe_math;
 mod auto_rent;
 
+#[cfg(test)]
+mod scholar_error_tests;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Internal contract event variants.
 pub enum Event {
@@ -1160,18 +1163,87 @@ pub enum ZKError {
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum ScholarErr {
-    Unauthorized = 1,
-    TimelockNotExpired = 2,
-    OracleDataStale = 3,
-    ReplayAttack = 4,
-    InvalidOracleSig = 5,
-    // Issue #262: Anti-frontrunning errors
-    CommitNotFound = 6,
-    RevealTooEarly = 7,
-    RevealExpired = 8,
-    CommitHashMismatch = 9,
+pub enum ScholarError {
+    // Authorization errors (0x1000-0x10FF)
+    Unauthorized = 0x1000,
+    NotPlatformAdmin = 0x1001,
+    NotUniversityAdmin = 0x1002,
+    NotSecurityCouncil = 0x1003,
+    NotCommitteeMember = 0x1004,
+    Sep12VerificationRequired = 0x1005,
+    
+    // Scholarship state errors (0x1100-0x11FF)
+    ScholarshipPaused = 0x1100,
+    ScholarshipDisputed = 0x1101,
+    ScholarshipNotFound = 0x1102,
+    FinalReleaseAlreadyClaimed = 0x1103,
+    FinalReleaseNotLocked = 0x1104,
+    FinalReleaseLocked = 0x1105,
+    
+    // Financial errors (0x1200-0x12FF)
+    InsufficientBalance = 0x1200,
+    AmountExceedsAvailableBalance = 0x1201,
+    AmountExceedsUnlockedBalance = 0x1202,
+    InvalidAmount = 0x1203,
+    ProtocolFeeOverflow = 0x1204,
+    TaxRateTooHigh = 0x1205,
+    NoBalanceToDistribute = 0x1206,
+    NativeXLMReserveViolation = 0x1207,
+    
+    // Security hold errors (0x1300-0x13FF)
+    UniversitySecurityHoldActive = 0x1300,
+    SecurityHoldAlreadyInactive = 0x1301,
+    SecurityHoldNotFound = 0x1302,
+    
+    // Community voting errors (0x1400-0x14FF)
+    VoteAlreadyInitiated = 0x1400,
+    VoteAlreadyPassed = 0x1401,
+    VoterAlreadyVoted = 0x1402,
+    VoteNotPassed = 0x1403,
+    VoteNotFound = 0x1404,
+    
+    // Academic milestone errors (0x1500-0x15FF)
+    MilestoneNotReady = 0x1500,
+    MilestoneAlreadyClaimed = 0x1501,
+    GPABelowThreshold = 0x1502,
+    GPANotSubmitted = 0x1503,
+    TranscriptNotVerified = 0x1504,
+    
+    // Configuration errors (0x1600-0x16FF)
+    InvalidConfiguration = 0x1600,
+    ClawbackPercentageTooHigh = 0x1601,
+    CommitteeFull = 0x1602,
+    InvalidSlot = 0x1603,
+    BadMilestoneCount = 0x1604,
+    BadMaskLength = 0x1605,
+    MilestoneDependencyCycle = 0x1606,
+    
+    // Reputation export errors (0x1700-0x17FF)
+    ExportBlockedPendingDiscipline = 0x1700,
+    ReputationExportReplay = 0x1701,
+    CrossChainDedupCollision = 0x1702,
+    
+    // Committee review errors (0x1800-0x18FF)
+    NoActiveCommitteeSession = 0x1800,
+    CommitteeStillInWindow = 0x1801,
+    AlreadyFinalized = 0x1802,
+    CommitteeSessionNotFound = 0x1803,
+    
+    // Oracle and data errors (0x1900-0x19FF)
+    OracleDataStale = 0x1900,
+    InvalidOracleSignature = 0x1901,
+    TimelockNotExpired = 0x1902,
+    ReplayAttack = 0x1903,
+    
+    // System errors (0x1A00-0x1AFF)
+    LeaderboardEmpty = 0x1A00,
+    ResearchBonusNotInitialized = 0x1A01,
+    InvalidTimestamp = 0x1A02,
+    ExecutionDelayNotMet = 0x1A03,
 }
+
+// Legacy alias for backward compatibility
+pub type ScholarErr = ScholarError;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -2399,7 +2471,11 @@ impl ScholarContract {
             .expect("No scholarship found");
 
         if scholarship.is_paused || scholarship.is_disputed {
-            panic!("Scholarship is paused or disputed");
+            if scholarship.is_paused {
+                return Err(ScholarError::ScholarshipPaused);
+            } else {
+                return Err(ScholarError::ScholarshipDisputed);
+            }
         }
 
         // Issue #115: Block withdrawals during an active university security hold
@@ -2415,9 +2491,7 @@ impl ScholarContract {
             {
                 let now = env.ledger().timestamp();
                 if hold.is_active && now < hold.expires_at {
-                    panic!(
-                        "Scholarship withdrawals are suspended: university security hold is active"
-                    );
+                    return Err(ScholarError::UniversitySecurityHoldActive);
                 }
             }
         }
@@ -2429,7 +2503,7 @@ impl ScholarContract {
             100,
         );
         if scholarship.balance <= locked_amount && !scholarship.final_release_claimed {
-            panic!("Final 10% is locked pending community vote");
+            return Err(ScholarError::FinalReleaseLocked);
         }
 
         let mut available_to_withdraw = scholarship.unlocked_balance;
@@ -2447,11 +2521,11 @@ impl ScholarContract {
         }
 
         if amount > available_to_withdraw {
-            panic!("Amount exceeds available unlocked balance");
+            return Err(ScholarError::AmountExceedsAvailableBalance);
         }
 
         if scholarship.balance < amount {
-            panic!("Insufficient balance");
+            return Err(ScholarError::InsufficientBalance);
         }
 
         // Issue #112: Apply tax
@@ -2491,7 +2565,7 @@ impl ScholarContract {
             let existing: i128 = env.storage().instance().get(&key).unwrap_or(0);
             let updated = existing
                 .checked_add(tax_amount)
-                .unwrap_or_else(|| panic!("Protocol fee overflow"));
+                .ok_or(ScholarError::ProtocolFeeOverflow)?;
             env.storage().instance().set(&key, &updated);
         }
     }
@@ -2525,10 +2599,10 @@ impl ScholarContract {
     pub fn set_tax_rate(env: Env, admin: Address, rate_bps: u32) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Not authorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         if rate_bps > 10000 {
-            panic!("Tax rate cannot exceed 100%");
+            return Err(ScholarError::TaxRateTooHigh);
         }
         env.storage().instance().set(&DataKey::TaxRate, &rate_bps);
     }
@@ -2536,7 +2610,7 @@ impl ScholarContract {
     pub fn set_protocol_fee_recipient(env: Env, admin: Address, recipient: Address) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Not authorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         env.storage()
             .instance()
@@ -2553,7 +2627,7 @@ impl ScholarContract {
     pub fn claim_protocol_fees(env: Env, admin: Address, token: Address, amount: i128) -> i128 {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Not authorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
 
         if amount <= 0 {
@@ -2875,7 +2949,11 @@ impl ScholarContract {
             100,
         );
         if scholarship.balance > locked_amount || scholarship.final_release_claimed {
-            panic!("Final release vote cannot be initiated yet");
+            if scholarship.final_release_claimed {
+                return Err(ScholarError::FinalReleaseAlreadyClaimed);
+            } else {
+                return Err(ScholarError::FinalReleaseNotLocked);
+            }
         }
 
         if env
@@ -2883,7 +2961,7 @@ impl ScholarContract {
             .persistent()
             .has(&DataKey::CommunityVote(student.clone()))
         {
-            panic!("Vote already initiated");
+            return Err(ScholarError::VoteAlreadyInitiated);
         }
 
         let vote = CommunityVote {
@@ -2965,10 +3043,10 @@ impl ScholarContract {
             .expect("No vote initiated for this student");
 
         if vote.is_passed {
-            panic!("Vote has already passed");
+            return Err(ScholarError::VoteAlreadyPassed);
         }
         if vote.voters.contains(&voter) {
-            panic!("Voter has already voted");
+            return Err(ScholarError::VoterAlreadyVoted);
         }
 
         vote.voters.push_back(voter);
@@ -3045,7 +3123,7 @@ impl ScholarContract {
             .expect("No vote found for this student");
 
         if !vote.is_passed {
-            panic!("Community vote has not passed");
+            return Err(ScholarError::VoteNotPassed);
         }
 
         let mut scholarship: Scholarship = env
@@ -3055,7 +3133,7 @@ impl ScholarContract {
             .expect("No scholarship found");
 
         if scholarship.final_release_claimed {
-            panic!("Final release already claimed");
+            return Err(ScholarError::FinalReleaseAlreadyClaimed);
         }
 
         let locked_amount = safe_math::div_i128(
@@ -3064,19 +3142,19 @@ impl ScholarContract {
             100,
         );
         if scholarship.balance > locked_amount {
-            panic!("Final release not yet locked");
+            return Err(ScholarError::FinalReleaseNotLocked);
         }
 
         let amount_to_release = scholarship.balance;
 
         if amount_to_release <= 0 {
-            panic!("No balance to claim");
+            return Err(ScholarError::NoBalanceToDistribute);
         }
 
         // Issue #118: Native XLM Reserve still applies
         if scholarship.is_native {
             if amount_to_release < NATIVE_XLM_RESERVE {
-                panic!("Final balance is less than gas reserve");
+                return Err(ScholarError::NativeXLMReserveViolation);
             }
             let final_claim = safe_math::sub_i128(&env, amount_to_release, NATIVE_XLM_RESERVE);
             scholarship.balance = safe_math::sub_i128(&env, scholarship.balance, final_claim);
@@ -3460,7 +3538,7 @@ impl ScholarContract {
     ) {
         platform_admin.require_auth();
         if !Self::is_admin(&env, &platform_admin) {
-            panic!("Not authorized: caller is not the platform admin");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         env.storage()
             .persistent()
@@ -3509,7 +3587,7 @@ impl ScholarContract {
             .get(&DataKey::UniversityAdmin(university.clone()))
             .expect("University has no registered admin");
         if registered_admin != university_admin {
-            panic!("Not authorized: caller is not the university admin");
+            return Err(ScholarError::NotUniversityAdmin);
         }
         env.storage()
             .persistent()
@@ -3569,7 +3647,7 @@ impl ScholarContract {
             .get(&DataKey::UniversityAdmin(university.clone()))
             .expect("University has no registered admin");
         if registered_admin != university_admin {
-            panic!("Not authorized: caller is not the university admin");
+            return Err(ScholarError::NotUniversityAdmin);
         }
 
         let now = env.ledger().timestamp();
@@ -3643,7 +3721,7 @@ impl ScholarContract {
             .get(&DataKey::UniversityAdmin(university.clone()))
             .expect("University has no registered admin");
         if registered_admin != university_admin {
-            panic!("Not authorized: caller is not the university admin");
+            return Err(ScholarError::NotUniversityAdmin);
         }
 
         let mut hold: SecurityHold = env
@@ -3653,7 +3731,7 @@ impl ScholarContract {
             .expect("No active security hold found for this university");
 
         if !hold.is_active {
-            panic!("Security hold is already inactive");
+            return Err(ScholarError::SecurityHoldAlreadyInactive);
         }
 
         hold.is_active = false;
@@ -3673,10 +3751,10 @@ impl ScholarContract {
     pub fn accrue_treasury_yield(env: Env, admin: Address, yield_amount: i128) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Not authorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         if yield_amount <= 0 {
-            panic!("Yield must be positive");
+            return Err(ScholarError::InvalidAmount);
         }
 
         let mut fund: ResearchBonusFund = env
@@ -3702,7 +3780,7 @@ impl ScholarContract {
     pub fn register_surprise_recipient(env: Env, admin: Address, rank: u64, student: Address) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Not authorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
         env.storage()
             .persistent()
@@ -3715,7 +3793,7 @@ impl ScholarContract {
     pub fn distribute_surprise_bonus(env: Env, admin: Address) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
-            panic!("Not authorized");
+            return Err(ScholarError::NotPlatformAdmin);
         }
 
         let mut fund: ResearchBonusFund = env
@@ -3725,7 +3803,7 @@ impl ScholarContract {
             .expect("Research Bonus Fund not initialized");
 
         if fund.total_balance <= 0 {
-            panic!("No balance to distribute");
+            return Err(ScholarError::NoBalanceToDistribute);
         }
 
         let leaderboard_size: u64 = env
@@ -3735,7 +3813,7 @@ impl ScholarContract {
             .unwrap_or(0);
 
         if leaderboard_size == 0 {
-            panic!("Leaderboard is empty");
+            return Err(ScholarError::LeaderboardEmpty);
         }
 
         let recipient_count = core::cmp::max(1u64, leaderboard_size / 20);
@@ -4311,7 +4389,7 @@ impl ScholarContract {
 
         // Validate clawback percentage
         if clawback_percentage > MAX_CLAWBACK_PERCENTAGE {
-            panic!("Clawback percentage exceeds maximum");
+            return Err(ScholarError::ClawbackPercentageTooHigh);
         }
 
         // Verify scholarship exists
