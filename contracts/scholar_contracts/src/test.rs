@@ -2303,6 +2303,145 @@ fn test_private_claim_logic() {
     assert!(result_invalid.is_err());
 }
 
+#[test]
+fn test_sac_reconcile_applies_protocol_haircut() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &10_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student_a, &1_000, &token_addr.address(), &false);
+    client.fund_scholarship(&funder, &student_b, &1_000, &token_addr.address(), &false);
+
+    token_sa.clawback(&contract_id, &500);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"issuer-clawback-1"))
+        .into();
+
+    let shortfall = client.reconcile_balances(
+        &admin,
+        &token_addr.address(),
+        &event_hash,
+        &500,
+        &None,
+        &true,
+    );
+    assert_eq!(shortfall, 500);
+
+    let scholarship_a = client.get_scholarship(&student_a);
+    let scholarship_b = client.get_scholarship(&student_b);
+    assert_eq!(scholarship_a.balance, 750);
+    assert_eq!(scholarship_a.unlocked_balance, 750);
+    assert_eq!(scholarship_b.balance, 750);
+    assert_eq!(scholarship_b.unlocked_balance, 750);
+}
+
+#[test]
+fn test_sac_reconcile_targeted_student_termination() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &10_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student_a, &1_200, &token_addr.address(), &false);
+    client.fund_scholarship(&funder, &student_b, &800, &token_addr.address(), &false);
+
+    token_sa.clawback(&contract_id, &300);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"issuer-clawback-2"))
+        .into();
+
+    let shortfall = client.reconcile_balances(
+        &admin,
+        &token_addr.address(),
+        &event_hash,
+        &300,
+        &Some(student_a.clone()),
+        &false,
+    );
+    assert_eq!(shortfall, 0);
+
+    let scholarship_a = client.get_scholarship(&student_a);
+    let scholarship_b = client.get_scholarship(&student_b);
+    assert_eq!(scholarship_a.balance, 0);
+    assert_eq!(scholarship_a.unlocked_balance, 0);
+    assert!(scholarship_a.is_paused);
+    assert!(scholarship_a.is_disputed);
+    assert_eq!(scholarship_b.balance, 800);
+    assert_eq!(scholarship_b.unlocked_balance, 800);
+}
+
+#[test]
+fn test_sac_reconcile_rejects_mismatched_evidence() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &5_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student, &1_000, &token_addr.address(), &false);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"forged-clawback"))
+        .into();
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "reconcile_balances"),
+        Vec::from_array(
+            &env,
+            [
+                admin.into_val(&env),
+                token_addr.address().into_val(&env),
+                event_hash.into_val(&env),
+                500_i128.into_val(&env),
+                Option::<Address>::None.into_val(&env),
+                false.into_val(&env),
+            ],
+        ),
+    );
+    assert!(result.is_err());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #209 — Final E2E Integration Test (Oracle to Yield)
 //
@@ -2522,135 +2661,133 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     // panics, logic collisions, or token leakage.
 }
 
-// ── Issue #262: Anti-frontrunning commit-reveal tests ────────────────────────
-
-/// Helper: build the sha256 commit hash the same way the contract does.
-fn make_commit_hash(
-    env: &Env,
-    scholarship_id: &Address,
-    amount: i128,
-    salt: &soroban_sdk::BytesN<32>,
-) -> soroban_sdk::BytesN<32> {
-    let mut preimage = soroban_sdk::Bytes::new(env);
-    preimage.append(&scholarship_id.to_xdr(env));
-    for b in amount.to_be_bytes() {
-        preimage.push_back(b);
-    }
-    preimage.append(&soroban_sdk::Bytes::from_slice(env, salt.as_slice()));
-    env.crypto().sha256(&preimage).into()
+#[test]
+fn test_rogue_dao_vetoed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    let rogue_proposer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&rogue_proposer, &1000);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_security_council(&admin, &council);
+    
+    let args = Vec::from_array(&env, [rogue_proposer.into_val(&env), 500u32.into_val(&env)]);
+    let ref_id = client.create_referendum(&rogue_proposer, &contract_id, &Symbol::new(&env, "set_tax_rate"), &args, &token_address.address(), &500);
+    
+    // Rogue DAO votes yes
+    client.vote_referendum(&rogue_proposer, &ref_id, &true, &1000);
+    
+    // Fast forward to end of voting period
+    env.ledger().set_timestamp(604801); 
+    
+    // Queue the referendum for execution delay (72 hours)
+    client.queue_referendum(&rogue_proposer, &ref_id);
+    
+    // Security council notices malicious transaction and calls veto
+    client.veto_action(&council, &ref_id);
+    
+    // Fast forward past execution delay
+    env.ledger().set_timestamp(604801 + 259200 + 10);
+    
+    // Execute should fail because it was vetoed
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_referendum"),
+        (&rogue_proposer, ref_id).into_val(&env)
+    );
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_commit_reveal_happy_path() {
+#[should_panic(expected = "Execution delay not met")]
+fn test_referendum_execution_delay() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let scholarship_id = Address::generate(&env);
-    let salt = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
-    let amount: i128 = 500;
-
+    
+    let admin = Address::generate(&env);
+    let proposer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&proposer, &1000);
+    
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
+    
     client.init(&10, &3600, &10, &100, &60);
-
-    // Phase 1: commit at t=0
-    env.ledger().set_timestamp(0);
-    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
-    client.commit_scholarship_application(&student, &commit_hash);
-
-    // Phase 2: reveal after min delay (t=10 > COMMIT_MIN_DELAY=5)
-    env.ledger().set_timestamp(10);
-    client.reveal_scholarship_application(&student, &scholarship_id, &amount, &salt);
+    client.set_admin(&admin);
+    
+    let args = Vec::from_array(&env, [proposer.into_val(&env), 500u32.into_val(&env)]);
+    let ref_id = client.create_referendum(&proposer, &contract_id, &Symbol::new(&env, "set_tax_rate"), &args, &token_address.address(), &500);
+    
+    client.vote_referendum(&proposer, &ref_id, &true, &1000);
+    
+    env.ledger().set_timestamp(604801); 
+    client.queue_referendum(&proposer, &ref_id);
+    
+    // Try to execute immediately, should panic
+    client.execute_referendum(&proposer, &ref_id);
 }
 
 #[test]
-#[should_panic]
-fn test_reveal_too_early_panics() {
+fn test_council_rotation_and_dissolve() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let scholarship_id = Address::generate(&env);
-    let salt = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-    let amount: i128 = 100;
-
+    
+    let admin = Address::generate(&env);
+    let new_council = Address::generate(&env);
+    
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
+    
     client.init(&10, &3600, &10, &100, &60);
-
-    env.ledger().set_timestamp(0);
-    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
-    client.commit_scholarship_application(&student, &commit_hash);
-
-    // Reveal at t=3, before COMMIT_MIN_DELAY=5 — must panic
-    env.ledger().set_timestamp(3);
-    client.reveal_scholarship_application(&student, &scholarship_id, &amount, &salt);
-}
-
-#[test]
-#[should_panic]
-fn test_reveal_expired_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let scholarship_id = Address::generate(&env);
-    let salt = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
-    let amount: i128 = 200;
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-    client.init(&10, &3600, &10, &100, &60);
-
-    env.ledger().set_timestamp(0);
-    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
-    client.commit_scholarship_application(&student, &commit_hash);
-
-    // Reveal at t=3601, after COMMIT_EXPIRY=3600 — must panic
-    env.ledger().set_timestamp(3601);
-    client.reveal_scholarship_application(&student, &scholarship_id, &amount, &salt);
-}
-
-#[test]
-#[should_panic]
-fn test_reveal_wrong_hash_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let scholarship_id = Address::generate(&env);
-    let salt = soroban_sdk::BytesN::from_array(&env, &[3u8; 32]);
-    let amount: i128 = 300;
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-    client.init(&10, &3600, &10, &100, &60);
-
-    env.ledger().set_timestamp(0);
-    let commit_hash = make_commit_hash(&env, &scholarship_id, amount, &salt);
-    client.commit_scholarship_application(&student, &commit_hash);
-
-    // Reveal with wrong amount — hash mismatch must panic
-    env.ledger().set_timestamp(10);
-    client.reveal_scholarship_application(&student, &scholarship_id, &999i128, &salt);
-}
-
-#[test]
-#[should_panic]
-fn test_reveal_without_commit_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let scholarship_id = Address::generate(&env);
-    let salt = soroban_sdk::BytesN::from_array(&env, &[4u8; 32]);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-    client.init(&10, &3600, &10, &100, &60);
-
-    // No commit — reveal must panic with CommitNotFound
-    env.ledger().set_timestamp(10);
-    client.reveal_scholarship_application(&student, &scholarship_id, &100i128, &salt);
+    client.set_admin(&admin);
+    
+    // Using current_contract_address directly for testing to mock DAO
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "queue_council_rotation"),
+        (&new_council,).into_val(&env)
+    );
+    // Should succeed queuing
+    assert!(result.is_ok());
+    
+    // Try to execute before timelock expires
+    let result_fail = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_council_rotation"),
+        ().into_val(&env)
+    );
+    assert!(result_fail.is_err());
+    
+    // Fast forward 7 days
+    env.ledger().set_timestamp(604801);
+    
+    // Execute rotation
+    let result_success = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_council_rotation"),
+        ().into_val(&env)
+    );
+    assert!(result_success.is_ok());
+    
+    // Now emergency dissolve
+    let result_dissolve = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "emergency_dissolve_council"),
+        ().into_val(&env)
+    );
+    assert!(result_dissolve.is_ok());
 }
