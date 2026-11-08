@@ -42,6 +42,8 @@ pub enum DataKey {
     Scholarship(Address), // student -> Scholarship struct
     VetoedCourseGlobal(u64),
     Session(Address),
+    CourseCreator(u64),
+    CourseCompleted(Address, u64),
 }
 
 #[contracttype]
@@ -396,6 +398,87 @@ impl ScholarContract {
             }
         }
         0
+    }
+
+    pub fn set_course_creator(env: Env, admin: Address, course_id: u64, creator: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        env.storage().instance().set(&DataKey::CourseCreator(course_id), &creator);
+    }
+
+    pub fn batch_grant_access(env: Env, caller: Address, students: Vec<Address>, course_id: u64) {
+        Self::batch_grant_access_with_duration(env, caller, students, course_id, 0);
+    }
+
+    pub fn batch_grant_access_with_duration(env: Env, caller: Address, students: Vec<Address>, course_id: u64, duration_seconds: u64) {
+        caller.require_auth();
+
+        let is_admin = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin).map(|a| a == caller).unwrap_or(false);
+        let is_teacher = env.storage().instance().get::<DataKey, bool>(&DataKey::IsTeacher(caller.clone())).unwrap_or(false);
+        let is_creator = env.storage().instance().get::<DataKey, Address>(&DataKey::CourseCreator(course_id)).map(|a| a == caller).unwrap_or(false);
+
+        if !is_admin && !is_teacher && !is_creator {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+
+        let current_time = env.ledger().timestamp();
+        let effective_duration = if duration_seconds > 0 {
+            duration_seconds
+        } else {
+            env.storage().instance().get(&DataKey::CourseDuration(course_id)).unwrap_or(30 * 24 * 60 * 60)
+        };
+
+        for i in 0..students.len() {
+            let student = students.get(i).unwrap();
+            let mut access = env.storage().instance().get(&DataKey::Access(student.clone(), course_id))
+                .unwrap_or(Access {
+                    student: student.clone(),
+                    course_id,
+                    expiry_time: current_time,
+                    token: caller.clone(),
+                    total_watch_time: 0,
+                    last_heartbeat: 0,
+                });
+
+            if access.expiry_time > current_time {
+                access.expiry_time += effective_duration;
+            } else {
+                access.expiry_time = current_time + effective_duration;
+            }
+
+            env.storage().instance().set(&DataKey::Access(student, course_id), &access);
+        }
+    }
+
+    pub fn complete_course(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+
+        let access: Access = env.storage().instance().get(&DataKey::Access(student.clone(), course_id))
+            .expect("No access found");
+
+        let course_duration: u64 = env.storage().instance().get(&DataKey::CourseDuration(course_id))
+            .expect("Course duration not set");
+
+        if access.total_watch_time < course_duration {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+
+        let timestamp = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::CourseCompleted(student.clone(), course_id), &timestamp);
+        env.storage().instance().set(&DataKey::SbtMinted(student.clone(), course_id), &true);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "CourseCompleted"), student, course_id),
+            timestamp
+        );
+    }
+
+    pub fn is_course_completed(env: Env, student: Address, course_id: u64) -> bool {
+        env.storage().instance().has(&DataKey::CourseCompleted(student, course_id))
     }
 }
 

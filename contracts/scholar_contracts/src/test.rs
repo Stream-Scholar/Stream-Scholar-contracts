@@ -458,3 +458,101 @@ fn test_calculate_remaining_airtime_zero_flow_rate() {
     // Should return 0 due to zero flow_rate guard
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
 }
+
+#[test]
+fn test_batch_grant_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let teacher = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_teacher(&admin, &teacher, &true);
+    client.set_course_duration(&101, &7200);
+
+    let mut students = Vec::new(&env);
+    students.push_back(s1.clone());
+    students.push_back(s2.clone());
+    students.push_back(s3.clone());
+
+    // Initially none have access
+    assert_eq!(client.has_access(&s1, &101), false);
+    assert_eq!(client.has_access(&s2, &101), false);
+    assert_eq!(client.has_access(&s3, &101), false);
+
+    // Teacher bulk grants access for 5 days
+    client.batch_grant_access_with_duration(&teacher, &students, &101, &(5 * 86400));
+
+    // Now all students have access
+    assert_eq!(client.has_access(&s1, &101), true);
+    assert_eq!(client.has_access(&s2, &101), true);
+    assert_eq!(client.has_access(&s3, &101), true);
+}
+
+#[test]
+#[should_panic]
+fn test_batch_grant_access_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let rando = Address::generate(&env);
+    let s1 = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    let mut students = Vec::new(&env);
+    students.push_back(s1);
+
+    // Unauthorized rando cannot batch grant
+    client.batch_grant_access(&rando, &students, &101);
+}
+
+#[test]
+fn test_complete_course() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_course_duration(&201, &120);
+
+    let mut students = Vec::new(&env);
+    students.push_back(student.clone());
+    client.batch_grant_access_with_duration(&admin, &students, &201, &86400);
+
+    let sig = soroban_sdk::Bytes::from_slice(&env, b"test_signature");
+
+    // Send heartbeats to accrue 120 seconds of watch time
+    env.ledger().set_timestamp(100);
+    client.heartbeat(&student, &201, &sig);
+
+    env.ledger().set_timestamp(160);
+    client.heartbeat(&student, &201, &sig);
+
+    env.ledger().set_timestamp(220);
+    client.heartbeat(&student, &201, &sig);
+
+    assert_eq!(client.is_course_completed(&student, &201), false);
+
+    // Complete course
+    client.complete_course(&student, &201);
+
+    assert_eq!(client.is_course_completed(&student, &201), true);
+    assert_eq!(client.is_sbt_minted(&student, &201), true);
+}
+
